@@ -5,9 +5,6 @@ let sensorHistory = [];
 const chartColor = '#00e5a0';
 
 // ========== Deployment Mode Detection ==========
-// If NOT running on an ESP32 local IP, we're on Netlify (or another remote host).
-// In Netlify mode: Firebase is the ONLY data source & all controls go through Firebase.
-// In Local mode: ESP32 local API is primary, Firebase supplements for history.
 const IS_NETLIFY = !(
     window.location.hostname === 'localhost' ||
     window.location.hostname === '127.0.0.1' ||
@@ -16,8 +13,8 @@ const IS_NETLIFY = !(
     /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(window.location.hostname)
 );
 
-const DATA_SOURCE_LABEL = IS_NETLIFY ? 'Firebase Cloud' : 'Local ESP32 + Firebase';
-console.log(`Running in ${IS_NETLIFY ? 'NETLIFY (Firebase-only)' : 'LOCAL (ESP32)'} mode`);
+const DATA_SOURCE_LABEL = IS_NETLIFY ? 'Firebase Cloud' : 'Local ESP32';
+console.log(`Running in ${IS_NETLIFY ? 'NETLIFY (Firebase Cloud)' : 'LOCAL (ESP32 Direct)'} mode`);
 
 // ========== ApexCharts Config ==========
 const apexChartOptions = {
@@ -94,32 +91,43 @@ document.addEventListener('DOMContentLoaded', () => {
     setText('csvStatus', DATA_SOURCE_LABEL);
 
     if (!IS_NETLIFY) {
-        // Local mode: also poll ESP32 directly
+        // Local mode: poll ESP32 directly via HTTP API
         fetchLiveData();
         checkStatus();
         fetchGsmSettings();
         liveDataInterval = setInterval(fetchLiveData, 5000);
         setInterval(checkStatus, 15000);
     } else {
-        // Netlify mode: Firebase listener is the sole source — load GSM from Firebase
+        // Netlify mode: GSM settings from Firebase
         fetchGsmSettingsFromFirebase();
     }
 });
 
 // ========== Firebase Listeners ==========
 function setupFirebaseListeners() {
-    if (!firebaseInitialized || !db) return;
+    if (!firebaseInitialized || !db) {
+        if (IS_NETLIFY) setConnection(false, 'Firebase SDK missing');
+        return;
+    }
 
     // Live sensor data from Firebase (real-time push from ESP32)
     db.ref('sensors/live').on('value', (snapshot) => {
         const data = snapshot.val();
         if (data) {
-            setConnection(true);
+            setConnection(true, IS_NETLIFY ? 'Firebase Live' : 'Connected');
             updateLiveDisplay(data);
+        } else {
+            // Firebase is connected, but waiting for ESP32 data push
+            if (IS_NETLIFY) {
+                setConnection(false, 'Waiting for ESP32 Data...');
+            }
         }
+    }, (error) => {
+        console.error("Firebase permission error:", error);
+        if (IS_NETLIFY) setConnection(false, 'Firebase Permission Denied');
     });
 
-    // Historical logs — load latest 100 on startup, then keep appending live
+    // Historical logs — load latest 100 on startup
     db.ref('sensors/history').limitToLast(100).on('value', (snapshot) => {
         const historyObj = snapshot.val();
         if (historyObj) {
@@ -136,24 +144,23 @@ function setupFirebaseListeners() {
 }
 
 // ========== Control Helpers ==========
-// Write a pump command to Firebase — ESP32 reads and executes it
 async function firebaseControl(path, value) {
-    if (!firebaseInitialized || !db) {
-        throw new Error('Firebase not available');
-    }
+    if (!firebaseInitialized || !db) return;
     return db.ref(path).set(value);
 }
 
 // ========== Control Buttons ==========
 async function controlPump(action) {
-    if (IS_NETLIFY) {
-        try {
-            await firebaseControl('controls/pump', action);
-            showToast(`Air Pump command sent: ${action.toUpperCase()}`);
-        } catch (error) {
-            alert(`Firebase control error: ${error.message}`);
-        }
-    } else {
+    // Send to Firebase
+    try {
+        await firebaseControl('controls/pump', action);
+        if (IS_NETLIFY) showToast(`Air Pump: ${action.toUpperCase()} sent to Firebase`);
+    } catch (e) {
+        console.warn("Firebase control set failed:", e);
+    }
+
+    // Send directly to local ESP32 if not on Netlify
+    if (!IS_NETLIFY) {
         try {
             const data = await apiPost('/api/pump', action);
             updateControlStates(
@@ -163,21 +170,21 @@ async function controlPump(action) {
             );
             await fetchLiveData();
         } catch (error) {
-            console.error('Pump control error:', error);
-            alert(`Failed to control pump: ${error.message}`);
+            console.error('Local pump control error:', error);
+            alert(`Failed to control pump locally: ${error.message}`);
         }
     }
 }
 
 async function controlPumpAuto(action) {
-    if (IS_NETLIFY) {
-        try {
-            await firebaseControl('controls/autoPump', action);
-            showToast(`Auto Pump ${action === 'enable' ? 'ENABLED' : 'DISABLED'}`);
-        } catch (error) {
-            alert(`Firebase control error: ${error.message}`);
-        }
-    } else {
+    try {
+        await firebaseControl('controls/autoPump', action);
+        if (IS_NETLIFY) showToast(`Auto Pump: ${action.toUpperCase()} sent to Firebase`);
+    } catch (e) {
+        console.warn("Firebase auto pump set failed:", e);
+    }
+
+    if (!IS_NETLIFY) {
         try {
             const data = await apiPost('/api/pump/auto', action);
             updateControlStates(
@@ -189,29 +196,29 @@ async function controlPumpAuto(action) {
             );
             await fetchLiveData();
         } catch (error) {
-            console.error('Auto pump control error:', error);
-            alert(`Failed to control auto pump: ${error.message}`);
+            console.error('Local auto pump control error:', error);
+            alert(`Failed to control auto pump locally: ${error.message}`);
         }
     }
 }
 
 async function controlWaterPump(action) {
-    if (IS_NETLIFY) {
-        try {
-            await firebaseControl('controls/waterPump', action);
-            showToast(`Water Pump command sent: ${action.toUpperCase()}`);
-        } catch (error) {
-            alert(`Firebase control error: ${error.message}`);
-        }
-    } else {
+    try {
+        await firebaseControl('controls/waterPump', action);
+        if (IS_NETLIFY) showToast(`Water Pump: ${action.toUpperCase()} sent to Firebase`);
+    } catch (e) {
+        console.warn("Firebase water pump set failed:", e);
+    }
+
+    if (!IS_NETLIFY) {
         try {
             const data = await apiPost('/api/waterpump', action);
             const waterPumpOn = data.waterPump === 'on';
             updateControlStates(false, false, false, 0, 0, waterPumpOn);
             await fetchLiveData();
         } catch (error) {
-            console.error('Water pump control error:', error);
-            alert(`Failed to control water pump: ${error.message}`);
+            console.error('Local water pump control error:', error);
+            alert(`Failed to control water pump locally: ${error.message}`);
         }
     }
 }
@@ -224,7 +231,7 @@ function showToast(message) {
         toast.id = 'toast-notification';
         toast.style.cssText = `
             position: fixed; bottom: 32px; left: 50%; transform: translateX(-50%);
-            background: rgba(0, 229, 160, 0.15); color: #00e5a0;
+            background: rgba(0, 229, 160, 0.18); color: #00e5a0;
             border: 1px solid rgba(0, 229, 160, 0.4); border-radius: 12px;
             padding: 12px 24px; font-family: Inter, sans-serif; font-size: 0.85rem;
             font-weight: 600; backdrop-filter: blur(8px); z-index: 9999;
@@ -238,7 +245,7 @@ function showToast(message) {
     toast._hideTimer = setTimeout(() => { toast.style.opacity = '0'; }, 3000);
 }
 
-// ========== GSM Settings via Firebase (Netlify mode) ==========
+// ========== GSM Settings ==========
 async function fetchGsmSettingsFromFirebase() {
     if (!firebaseInitialized || !db) return;
     db.ref('gsm').once('value', (snapshot) => {
@@ -258,13 +265,12 @@ async function saveGsmSettings() {
     const message     = document.getElementById('gsmMessage').value.trim();
     const enabled     = document.getElementById('gsmEnabled').checked;
 
+    try {
+        await firebaseControl('gsm', { phoneNumber, message, enabled });
+    } catch (e) {}
+
     if (IS_NETLIFY) {
-        try {
-            await firebaseControl('gsm', { phoneNumber, message, enabled });
-            showToast('GSM settings saved to Firebase ✓');
-        } catch (error) {
-            alert(`Failed to save GSM settings: ${error.message}`);
-        }
+        showToast('GSM settings saved to Firebase ✓');
     } else {
         try {
             const data = await apiPostForm('/api/gsm', {
@@ -289,14 +295,14 @@ function refreshData() {
         fetchLiveData();
         checkStatus();
     } else {
-        showToast('Dashboard is live — Firebase updates automatically');
+        showToast('Dashboard is live — updates automatically via Firebase');
     }
 }
 
 async function checkStatus() {
     try {
         const data = await apiGet('/api/status');
-        setConnection(true);
+        setConnection(true, 'ESP32 Connected');
         setText('csvStatus', 'Local ESP32');
         updateControlStates(
             data.pump === 'on',
@@ -307,12 +313,12 @@ async function checkStatus() {
         );
     } catch (error) {
         console.error('Status check error:', error);
-        if (!IS_NETLIFY) setConnection(false);
+        if (!IS_NETLIFY) setConnection(false, 'Local API Unreachable');
         setText('csvStatus', IS_NETLIFY ? 'Firebase Cloud' : 'Unavailable');
     }
 }
 
-// ========== ESP32 Local API ==========
+// ========== ESP32 Local API Helpers ==========
 async function apiGet(url) {
     const response = await fetch(url, { cache: 'no-store' });
     if (!response.ok) throw new Error(`GET ${url} failed: ${response.status}`);
@@ -320,7 +326,9 @@ async function apiGet(url) {
 }
 
 async function apiPost(url, action) {
-    const response = await fetch(url, {
+    // Include action in BOTH query string and body to guarantee ESPAsyncWebServer parsing
+    const fullUrl = `${url}?action=${encodeURIComponent(action)}`;
+    const response = await fetch(fullUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
         body: new URLSearchParams({ action }).toString()
@@ -333,7 +341,8 @@ async function apiPost(url, action) {
 }
 
 async function apiPostForm(url, params) {
-    const response = await fetch(url, {
+    const fullUrl = `${url}?${new URLSearchParams(params).toString()}`;
+    const response = await fetch(fullUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
         body: new URLSearchParams(params).toString()
@@ -348,14 +357,14 @@ async function apiPostForm(url, params) {
 async function fetchLiveData() {
     try {
         const data = await apiGet('/api/sensors');
-        setConnection(true);
+        setConnection(true, 'ESP32 Connected');
         updateLiveDisplay(data);
         sensorHistory.push({ timestamp: new Date(), ...data });
         if (sensorHistory.length > 100) sensorHistory.shift();
         updateCharts();
     } catch (error) {
         console.error('Fetch live data error:', error);
-        setConnection(false);
+        setConnection(false, 'Disconnected');
     }
 }
 
@@ -373,22 +382,22 @@ async function fetchGsmSettings() {
     }
 }
 
-// ========== Connection State ==========
-function setConnection(isConnected) {
+// ========== Connection State UI ==========
+function setConnection(isConnected, customLabel = '') {
     const liveDot = document.getElementById('liveDot');
     const badge   = document.getElementById('esp32Status');
 
     if (liveDot) {
         if (isConnected) {
             liveDot.classList.add('connected');
-            liveDot.textContent = IS_NETLIFY ? 'Firebase Live' : 'ESP32 Connected';
+            liveDot.textContent = customLabel || (IS_NETLIFY ? 'Firebase Live' : 'Connected');
         } else {
             liveDot.classList.remove('connected');
-            liveDot.textContent = 'Disconnected';
+            liveDot.textContent = customLabel || 'Disconnected';
         }
     }
     if (badge) {
-        badge.textContent  = isConnected ? 'Connected' : 'Disconnected';
+        badge.textContent  = isConnected ? 'Connected' : (customLabel || 'Disconnected');
         badge.style.color  = isConnected ? 'var(--accent)' : '#ff5050';
     }
 }
@@ -533,17 +542,14 @@ function updateSeries(chartKey, name, timestamps, values) {
 // ========== CSV Download Export ==========
 function downloadCSV() {
     if (!sensorHistory.length) {
-        if (IS_NETLIFY) {
-            // Try to fetch full history directly from Firebase for CSV export
-            if (firebaseInitialized && db) {
-                showToast('Fetching full history from Firebase...');
-                db.ref('sensors/history').once('value', (snapshot) => {
-                    const historyObj = snapshot.val();
-                    if (!historyObj) { alert('No history data in Firebase yet.'); return; }
-                    const allHistory = Object.values(historyObj).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-                    exportCSV(allHistory);
-                });
-            }
+        if (IS_NETLIFY && firebaseInitialized && db) {
+            showToast('Fetching history from Firebase...');
+            db.ref('sensors/history').once('value', (snapshot) => {
+                const historyObj = snapshot.val();
+                if (!historyObj) { alert('No history data in Firebase yet.'); return; }
+                const allHistory = Object.values(historyObj).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+                exportCSV(allHistory);
+            });
         } else {
             alert('No historical sensor data available to export.');
         }
