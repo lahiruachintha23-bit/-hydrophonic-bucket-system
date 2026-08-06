@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../../../../Desktop/hydroponic_dashboard/hydroponic_dashboard"
+		},
+		{
+			"name": "dutch bucket web dashboad",
+			"path": "."
+		}
+	],
+	"settings": {
+		"liveServer.settings.multiRootWorkspaceName": "dutch bucket web dashboad"
+	}
+}

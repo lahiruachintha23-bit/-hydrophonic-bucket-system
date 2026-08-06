@@ -1,0 +1,555 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+/* ========== Reset & Base ========== */
+*, *::before, *::after {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    --accent:        #00e5a0;
+    --accent-dim:    #00b87a;
+    --accent-glow:   rgba(0, 229, 160, 0.18);
+    --bg-deep:       #061209;
+    --bg-card:       rgba(8, 26, 18, 0.85);
+    --bg-card-hover: rgba(12, 38, 26, 0.95);
+    --border:        rgba(0, 200, 140, 0.15);
+    --border-hover:  rgba(0, 229, 160, 0.35);
+    --text-primary:  #e8fff5;
+    --text-secondary: rgba(180, 230, 210, 0.7);
+    --text-muted:    rgba(130, 190, 165, 0.55);
+    --badge-off-bg:  rgba(255,255,255,0.08);
+    --badge-off-fg:  rgba(200, 230, 215, 0.7);
+    --radius-card:   16px;
+    --radius-sm:     10px;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+    font-family: 'Inter', 'Segoe UI', sans-serif;
+    background: radial-gradient(ellipse 80% 60% at 90% 10%, #1a4d38 0%, #0d2418 40%, var(--bg-deep) 100%);
+    background-attachment: fixed;
+    color: var(--text-primary);
+    min-height: 100vh;
+    padding: 24px;
+    line-height: 1.5;
+}
+
+/* ========== Layout Container ========== */
+.container {
+    max-width: 1440px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+/* ========== Card Base ========== */
+.card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    backdrop-filter: blur(12px);
+    transition: border-color 0.25s, box-shadow 0.25s;
+}
+
+.card:hover {
+    border-color: var(--border-hover);
+    box-shadow: 0 0 28px rgba(0, 229, 160, 0.07);
+}
+
+/* ========== Header Card ========== */
+.header-card {
+    padding: 28px 36px;
+    position: relative;
+    overflow: hidden;
+}
+
+.header-card::before {
+    content: '';
+    position: absolute;
+    top: -60px; right: -60px;
+    width: 260px; height: 260px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(0,229,160,0.08) 0%, transparent 70%);
+    pointer-events: none;
+}
+
+.header-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.15em;
+    color: var(--accent);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+
+.header-title {
+    font-size: clamp(1.8rem, 3.5vw, 2.6rem);
+    font-weight: 700;
+    color: #ffffff;
+    letter-spacing: -0.02em;
+    margin-bottom: 8px;
+}
+
+.header-meta {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    flex-wrap: wrap;
+}
+
+.header-update {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+}
+
+.live-dot {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+}
+
+.live-dot::before {
+    content: '';
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: #ff4c4c;
+    box-shadow: 0 0 6px #ff4c4c;
+    animation: pulse-dot 1.8s ease-in-out infinite;
+}
+
+.live-dot.connected::before {
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+}
+
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%       { opacity: 0.5; transform: scale(0.75); }
+}
+
+/* ========== Sensor Grid ========== */
+.sensors-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+}
+
+.sensor-card {
+    padding: 20px 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    position: relative;
+    overflow: hidden;
+    cursor: default;
+    transition: transform 0.2s, border-color 0.25s, box-shadow 0.25s;
+}
+
+.sensor-card:hover {
+    transform: translateY(-3px);
+    border-color: var(--border-hover);
+    box-shadow: 0 8px 30px rgba(0, 229, 160, 0.08);
+}
+
+.sensor-label {
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    color: var(--accent);
+    text-transform: uppercase;
+}
+
+.sensor-value {
+    font-size: 2.1rem;
+    font-weight: 700;
+    color: #ffffff;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    margin: 4px 0 0;
+}
+
+.sensor-value .unit {
+    font-size: 0.9rem;
+    font-weight: 400;
+    color: var(--text-secondary);
+    margin-left: 2px;
+}
+
+.sensor-desc {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+/* Water level text sizing */
+#liveWaterLevel {
+    font-size: 1.8rem;
+}
+
+/* Pump card layout */
+.pump-card-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 4px;
+}
+
+.pump-status-text {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #ffffff;
+}
+
+.pump-badge {
+    padding: 5px 14px;
+    border-radius: 20px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: var(--badge-off-bg);
+    color: var(--badge-off-fg);
+    border: 1px solid rgba(200, 230, 215, 0.15);
+    transition: background 0.3s, color 0.3s, border-color 0.3s;
+}
+
+.pump-badge.on {
+    background: rgba(0, 229, 160, 0.15);
+    color: var(--accent);
+    border-color: rgba(0, 229, 160, 0.4);
+    box-shadow: 0 0 10px rgba(0, 229, 160, 0.15);
+}
+
+/* Reports card */
+.reports-card {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+
+.reports-desc {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+}
+
+.btn-download {
+    display: block;
+    width: 100%;
+    padding: 13px 20px;
+    background: var(--accent);
+    color: #061209;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-family: 'Inter', sans-serif;
+    font-size: 0.85rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+    text-align: center;
+    transition: background 0.2s, transform 0.15s, box-shadow 0.2s;
+    text-decoration: none;
+    margin-top: 14px;
+}
+
+.btn-download:hover {
+    background: #00ffb3;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 18px rgba(0, 229, 160, 0.35);
+}
+
+.btn-download:active {
+    transform: translateY(0);
+}
+
+/* ========== Section Heading ========== */
+.section-heading {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    color: var(--accent);
+    text-transform: uppercase;
+    margin-bottom: 14px;
+}
+
+/* ========== Charts ========== */
+.charts-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+}
+
+.chart-card {
+    padding: 20px 20px 10px;
+}
+
+.chart-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+
+.chart-title {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.13em;
+    color: var(--accent);
+    text-transform: uppercase;
+}
+
+.chart-badge {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+/* ========== Controls Section ========== */
+.controls-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+}
+
+.control-card {
+    padding: 22px;
+}
+
+.control-title {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    color: var(--accent);
+    text-transform: uppercase;
+    margin-bottom: 14px;
+}
+
+.control-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.btn {
+    padding: 11px 18px;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-family: 'Inter', sans-serif;
+    font-size: 0.83rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.15s, opacity 0.2s, box-shadow 0.2s;
+}
+
+.btn:hover  { transform: translateY(-1px); opacity: 0.9; }
+.btn:active { transform: scale(0.97); }
+
+.btn-success {
+    background: rgba(0, 229, 160, 0.15);
+    color: var(--accent);
+    border: 1px solid rgba(0, 229, 160, 0.35);
+}
+
+.btn-success:hover {
+    background: rgba(0, 229, 160, 0.25);
+    box-shadow: 0 4px 14px rgba(0, 229, 160, 0.2);
+}
+
+.btn-danger {
+    background: rgba(255, 80, 80, 0.1);
+    color: #ff7070;
+    border: 1px solid rgba(255, 80, 80, 0.25);
+}
+
+.btn-danger:hover {
+    background: rgba(255, 80, 80, 0.18);
+    box-shadow: 0 4px 14px rgba(255, 80, 80, 0.15);
+}
+
+.btn-primary {
+    background: var(--accent);
+    color: var(--bg-deep);
+    font-weight: 700;
+}
+
+.btn-primary:hover {
+    background: #00ffb3;
+    box-shadow: 0 4px 18px rgba(0, 229, 160, 0.3);
+}
+
+.control-status {
+    margin-top: 12px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.control-status span {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* ========== GSM Settings ========== */
+.settings-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+
+.settings-card {
+    padding: 22px;
+}
+
+.settings-field {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin-bottom: 14px;
+}
+
+.settings-field label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+}
+
+.settings-field input[type="text"],
+.settings-field textarea {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    color: var(--text-primary);
+    font-family: 'Inter', sans-serif;
+    font-size: 0.88rem;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    resize: vertical;
+}
+
+.settings-field input[type="text"]:focus,
+.settings-field textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0, 229, 160, 0.1);
+}
+
+.settings-field input[type="text"]::placeholder,
+.settings-field textarea::placeholder {
+    color: var(--text-muted);
+}
+
+.checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-direction: row;
+}
+
+.checkbox-row input[type="checkbox"] {
+    accent-color: var(--accent);
+    width: 16px; height: 16px;
+    cursor: pointer;
+}
+
+/* ========== System Status / Debug ========== */
+.debug-card {
+    padding: 22px;
+}
+
+.debug-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.debug-item {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    font-size: 0.82rem;
+}
+
+.debug-item strong {
+    color: var(--text-secondary);
+    display: block;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 3px;
+}
+
+.debug-item span {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.debug-actions {
+    display: flex;
+    gap: 12px;
+}
+
+.btn-refresh, .btn-status {
+    padding: 10px 20px;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-family: 'Inter', sans-serif;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.15s, opacity 0.2s;
+}
+
+.btn-refresh {
+    background: rgba(0, 229, 160, 0.12);
+    color: var(--accent);
+    border: 1px solid rgba(0, 229, 160, 0.3);
+}
+
+.btn-status {
+    background: rgba(100, 180, 255, 0.1);
+    color: #7ec8ff;
+    border: 1px solid rgba(100, 180, 255, 0.25);
+}
+
+.btn-refresh:hover, .btn-status:hover {
+    transform: translateY(-1px);
+    opacity: 0.85;
+}
+
+/* ========== Status connection element ========== */
+.status-connection {
+    font-size: 1.2rem;
+    font-weight: 600;
+    margin: 6px 0;
+}
+
+/* ========== Scrollbar ========== */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0, 229, 160, 0.25); border-radius: 10px; }
+
+/* ========== Responsive ========== */
+@media (max-width: 1100px) {
+    .sensors-grid { grid-template-columns: repeat(2, 1fr); }
+    .charts-grid   { grid-template-columns: repeat(2, 1fr); }
+    .controls-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 700px) {
+    body { padding: 12px; }
+    .sensors-grid   { grid-template-columns: 1fr; }
+    .charts-grid    { grid-template-columns: 1fr; }
+    .controls-grid  { grid-template-columns: 1fr; }
+    .settings-grid  { grid-template-columns: 1fr; }
+    .header-card    { padding: 20px; }
+    .header-title   { font-size: 1.6rem; }
+}

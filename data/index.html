@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Greenhouse Command Center | Hydroponics Monitoring</title>
+    <meta name="description" content="Real-time hydroponic system dashboard — live sensor readings, historical charts, and pump control for your ESP32 Dutch bucket greenhouse.">
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts@latest"></script>
+    <!-- Firebase JS SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
+</head>
+<body>
+    <div class="container">
+
+        <!-- ===== HEADER ===== -->
+        <header class="card header-card">
+            <div class="header-label">Hydroponics Monitoring</div>
+            <h1 class="header-title">ESP32 Greenhouse Command Center</h1>
+            <div class="header-meta">
+                <span class="header-update">Latest update: <span id="lastUpdate">--</span></span>
+                <span id="liveDot" class="live-dot">Connecting...</span>
+            </div>
+        </header>
+
+        <!-- ===== SENSOR CARDS ROW 1 ===== -->
+        <div class="sensors-grid">
+            <!-- Temperature -->
+            <div class="card sensor-card">
+                <span class="sensor-label">Temperature</span>
+                <div class="sensor-value" id="liveTemp">--<span class="unit">°C</span></div>
+                <span class="sensor-desc">DHT22 Sensor</span>
+            </div>
+
+            <!-- Humidity -->
+            <div class="card sensor-card">
+                <span class="sensor-label">Humidity</span>
+                <div class="sensor-value" id="liveHumidity">--<span class="unit">%</span></div>
+                <span class="sensor-desc">DHT22 Sensor</span>
+            </div>
+
+            <!-- Flow Rate -->
+            <div class="card sensor-card">
+                <span class="sensor-label">Flow Rate</span>
+                <div class="sensor-value" id="liveFlow">--<span class="unit">L/min</span></div>
+                <span class="sensor-desc">Flow Sensor</span>
+            </div>
+
+            <!-- EC Value -->
+            <div class="card sensor-card">
+                <span class="sensor-label">EC Value</span>
+                <div class="sensor-value" id="liveTDS">--<span class="unit">mS/cm</span></div>
+                <span class="sensor-desc">TDS Probe</span>
+            </div>
+
+            <!-- Water Level -->
+            <div class="card sensor-card">
+                <span class="sensor-label">Water Level</span>
+                <div class="sensor-value" id="liveWaterLevel">--</div>
+                <span class="sensor-desc">Float Switch</span>
+            </div>
+
+            <!-- Air Pump -->
+            <div class="card sensor-card">
+                <span class="sensor-label">Air Pump</span>
+                <div class="pump-card-inner">
+                    <span class="pump-status-text" id="airPumpStatus">Idle</span>
+                    <span class="pump-badge" id="airPumpBadge">OFF</span>
+                </div>
+                <span class="sensor-desc" id="autoPumpStateDesc">Auto: <span id="autoPumpState">--</span></span>
+            </div>
+
+            <!-- Water Pump -->
+            <div class="card sensor-card">
+                <span class="sensor-label">Water Pump</span>
+                <div class="pump-card-inner">
+                    <span class="pump-status-text" id="waterPumpStatus">Idle</span>
+                    <span class="pump-badge" id="waterPumpBadge">OFF</span>
+                </div>
+                <span class="sensor-desc">Water Pump Control</span>
+            </div>
+
+            <!-- Reports -->
+            <div class="card sensor-card reports-card">
+                <span class="sensor-label">Reports</span>
+                <p class="reports-desc">Export historical logs to CSV for daily analysis.</p>
+                <button class="btn-download" onclick="downloadCSV()">Download CSV Report</button>
+            </div>
+        </div>
+
+        <!-- ===== CHARTS ===== -->
+        <div class="section-heading">Historical Data Analysis</div>
+        <div class="charts-grid">
+            <div class="card chart-card">
+                <div class="chart-header">
+                    <span class="chart-title">Temperature</span>
+                    <span class="chart-badge">Historical</span>
+                </div>
+                <div id="chartTemperature"></div>
+            </div>
+            <div class="card chart-card">
+                <div class="chart-header">
+                    <span class="chart-title">Humidity</span>
+                    <span class="chart-badge">Historical</span>
+                </div>
+                <div id="chartHumidity"></div>
+            </div>
+            <div class="card chart-card">
+                <div class="chart-header">
+                    <span class="chart-title">Water Temperature</span>
+                    <span class="chart-badge">Historical</span>
+                </div>
+                <div id="chartWaterTemp"></div>
+            </div>
+            <div class="card chart-card">
+                <div class="chart-header">
+                    <span class="chart-title">Water Level</span>
+                    <span class="chart-badge">Historical</span>
+                </div>
+                <div id="chartWaterLevel"></div>
+            </div>
+            <div class="card chart-card">
+                <div class="chart-header">
+                    <span class="chart-title">EC Value</span>
+                    <span class="chart-badge">Historical</span>
+                </div>
+                <div id="chartTDS"></div>
+            </div>
+            <div class="card chart-card">
+                <div class="chart-header">
+                    <span class="chart-title">Flow Rate</span>
+                    <span class="chart-badge">Historical</span>
+                </div>
+                <div id="chartFlow"></div>
+            </div>
+        </div>
+
+        <!-- ===== SYSTEM CONTROLS ===== -->
+        <div class="section-heading">System Controls</div>
+        <div class="controls-grid">
+            <!-- Auto Pump -->
+            <div class="card control-card">
+                <div class="control-title">Automatic Pump Control</div>
+                <div class="control-buttons">
+                    <button class="btn btn-success" onclick="controlPumpAuto('enable')">✅ Auto ON (2.2–2.8 mS/cm)</button>
+                    <button class="btn btn-danger"  onclick="controlPumpAuto('disable')">❌ Auto OFF</button>
+                </div>
+                <p class="control-status">Auto Status: <span id="autoPumpStateBadge">--</span></p>
+                <p class="control-status">EC Thresholds: <span id="ecThresholds">--</span></p>
+            </div>
+
+            <!-- Manual Pump -->
+            <div class="card control-card">
+                <div class="control-title">Manual Pump Override</div>
+                <div class="control-buttons">
+                    <button class="btn btn-success" onclick="controlPump('on')">🟢 Pump ON</button>
+                    <button class="btn btn-danger"  onclick="controlPump('off')">🔴 Pump OFF</button>
+                </div>
+                <p class="control-status">Pump: <span id="pumpState">--</span></p>
+                <p class="control-status">Manual Override: <span id="manualOverrideStatus">Inactive</span></p>
+            </div>
+
+            <!-- Water Pump -->
+            <div class="card control-card">
+                <div class="control-title">Water Pump Control</div>
+                <div class="control-buttons">
+                    <button class="btn btn-success" onclick="controlWaterPump('on')">🟢 Water Pump ON</button>
+                    <button class="btn btn-danger"  onclick="controlWaterPump('off')">🔴 Water Pump OFF</button>
+                </div>
+                <p class="control-status">Water Pump: <span id="waterPumpState">--</span></p>
+            </div>
+        </div>
+
+        <!-- ===== GSM SETTINGS ===== -->
+        <div class="section-heading">GSM Alert Settings</div>
+        <div class="card settings-card">
+            <div class="settings-grid">
+                <div>
+                    <div class="settings-field">
+                        <label for="gsmPhoneNumber">Alert Phone Number</label>
+                        <input type="text" id="gsmPhoneNumber" placeholder="+94740879724">
+                    </div>
+                    <div class="settings-field">
+                        <label for="gsmMessage">Alert Message</label>
+                        <textarea id="gsmMessage" rows="3" placeholder="Water level is LOW"></textarea>
+                    </div>
+                </div>
+                <div style="display:flex; flex-direction:column; gap:14px;">
+                    <div class="settings-field">
+                        <label>Enable GSM Alerts</label>
+                        <div class="checkbox-row">
+                            <input type="checkbox" id="gsmEnabled">
+                            <span style="font-size:0.85rem; color:var(--text-secondary);">Send SMS on critical events</span>
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" onclick="saveGsmSettings()" style="margin-top:auto;">💾 Save GSM Settings</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===== SYSTEM STATUS ===== -->
+        <div class="section-heading">System Status</div>
+        <div class="card debug-card">
+            <div class="debug-grid">
+                <div class="debug-item">
+                    <strong>Mode</strong>
+                    <span id="debugCSVPath">ESP32 Live API</span>
+                </div>
+                <div class="debug-item">
+                    <strong>Sensor History</strong>
+                    <span><span id="debugCSVCount">0</span> readings</span>
+                </div>
+                <div class="debug-item">
+                    <strong>Last Update</strong>
+                    <span id="debugCSVTime">--</span>
+                </div>
+                <div class="debug-item">
+                    <strong>ESP32 IP</strong>
+                    <span>See Serial Monitor</span>
+                </div>
+                <div class="debug-item">
+                    <strong>ESP32 Status</strong>
+                    <span id="esp32Status">Checking...</span>
+                </div>
+                <div class="debug-item">
+                    <strong>Data Source</strong>
+                    <span id="csvStatus">--</span>
+                </div>
+            </div>
+            <div class="debug-actions">
+                <button onclick="refreshData()" class="btn-refresh">🔄 Refresh Now</button>
+                <button onclick="checkStatus()" class="btn-status">📡 Check Status</button>
+            </div>
+        </div>
+
+    </div><!-- /container -->
+
+    <script src="script.js"></script>
+</body>
+</html>

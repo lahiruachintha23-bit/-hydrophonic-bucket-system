@@ -1,0 +1,30 @@
+# Netlify deployment config
+[build]
+  # Publish the ESP32 SPIFFS web folder directly
+  publish = "data"
+
+# No build command needed — pure static files
+
+# Headers for Firebase SDK CORS and caching
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+[[headers]]
+  for = "/*.js"
+  [headers.values]
+    Cache-Control = "public, max-age=3600"
+
+[[headers]]
+  for = "/*.css"
+  [headers.values]
+    Cache-Control = "public, max-age=3600"
+
+# SPA-style fallback: all routes serve index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
