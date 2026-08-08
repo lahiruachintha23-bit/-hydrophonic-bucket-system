@@ -423,7 +423,10 @@ async function fetchLiveData() {
         const data = await apiGet('/api/sensors');
         setConnection(true, 'ESP32 Connected');
         updateLiveDisplay(data);
-        sensorHistory.push({ timestamp: new Date(), ...data });
+        // Spread FIRST, then override timestamp. The device sends its own
+        // `timestamp` field as millis() uptime, so spreading last would clobber
+        // the real clock and plot every local-mode point in Jan 1970.
+        sensorHistory.push({ ...data, timestamp: new Date() });
         if (sensorHistory.length > 100) sensorHistory.shift();
         updateCharts();
     } catch (error) {

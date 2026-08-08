@@ -10,23 +10,34 @@
 #include <Preferences.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <FirebaseESP32.h>
-#include <addons/TokenHelper.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 
 // ==================== Connection constants ====================
 const char* WIFI_SSID = "Infinix NOTE 40";
 const char* WIFI_PASSWORD = "Achi@234";
-const char* FIREBASE_DB_URL = "https://hydrophonic-bucket-system-default-rtdb.asia-southeast1.firebasedatabase.app/";
+// Realtime Database root, NO trailing slash. The REST helpers append the node
+// path plus ".json" (e.g. FIREBASE_DB_URL + "/sensors/live.json"), matching the
+// Firebase RTDB REST API. A trailing slash here would produce a double slash and
+// 404 every request.
+const char* FIREBASE_DB_URL = "https://hydrophonic-bucket-system-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* GSM_PHONE_NUMBER = "+94740879724";
 
-// ==================== Firebase ====================
-FirebaseData fbdo;      // sensor writes
-FirebaseData ctrlFbdo;  // control reads — must stay global; each FirebaseData
-                        // owns a large TLS buffer, so creating one per poll
-                        // fragments the heap and re-handshakes every time.
-FirebaseAuth fbAuth;
-FirebaseConfig fbConfig;
+// ==================== Firebase (REST over HTTPS) ====================
+// This project talks to the Realtime Database with the ESP32 core's own
+// WiFiClientSecure + HTTPClient, hitting the RTDB REST API directly, rather than
+// the mobizt Firebase-ESP32 library. The library's BearSSL layer intermittently
+// failed to initialize ("Failed to initialize the SSL layer") on this board;
+// setInsecure() REST calls are lighter, need no ~40KB contiguous handshake block,
+// and mirror the reference project's connection pattern.
+//
+// Forward declarations — the helpers are defined just above setupFirebase().
+int    firebasePut(const char *path, const String &jsonBody);
+int    firebasePost(const char *path, const String &jsonBody);
+int    firebaseDelete(const char *path);
+String firebaseGet(const char *path);
+String firebaseGetQuery(const char *path, const String &query);
 
 unsigned long lastFirebasePushMs = 0;
 unsigned long lastFirebaseHistoryMs = 0;
@@ -337,14 +348,20 @@ void checkFloatSwitchAlert(bool currentWaterLevelHigh) {
 }
 
 // ==================== Sensor Reading ====================
+// Raw ADC count from the last TDS read, kept for diagnostics. A submerged probe
+// reading 0 counts means no signal is reaching TDS_PIN at all (wiring/power),
+// as opposed to a real but badly-calibrated voltage.
+int lastTdsRawADC = 0;
+
 float readTdsPPM() {
   const int samples = 10;
   long total = 0;
   for (int i = 0; i < samples; i++) {
     total += analogRead(TDS_PIN);
-    delay(5);
+    delayMicroseconds(200);   // was delay(5): 50ms of blocking per read
   }
   float rawADC = total / (float)samples;
+  lastTdsRawADC = (int)rawADC;
   float voltage = (rawADC / ADC_MAX) * ADC_REF_VOLTAGE;
 
   // Simple approximate formula. Calibrate with a known solution later.
@@ -370,33 +387,68 @@ float readFlowMlMin() {
   return flowRateMlMin;
 }
 
-SensorData readAllSensors() {
-  SensorData data{};
-  data.timestamp = millis();
+// Single cached snapshot of sensor state. Everything (web API, LCD, control loop,
+// Firebase) reads this instead of hitting the hardware itself.
+//
+// Why: readAllSensors() used to be called three times per loop pass — from the
+// control loop, the LCD, and every /api/sensors request. The DHT22 is rated for
+// one reading every 2s; polling it every 50ms makes it self-heat and drift, which
+// is what produced impossible values like 74.7 C at 10.6% RH. The DS18B20 also
+// blocks ~750ms per conversion at 12-bit, so three calls a pass stalled the loop.
+// -1 marks "no valid reading yet"; the dashboard renders that as "--".
+SensorData latestData{ -1, -1, -1, 0, false, 0, 0, 0 };
 
-  float airTemp = dht.readTemperature();
-  float humidity = dht.readHumidity();
-  data.dhtTemp = isnan(airTemp) ? -1 : airTemp;
-  data.dhtHumidity = isnan(humidity) ? -1 : humidity;
+const unsigned long DHT_MIN_INTERVAL_MS = 2000;   // datasheet minimum for DHT22
+const unsigned long DS18B20_INTERVAL_MS = 2000;   // conversion is slow; no need to rush
+const unsigned long TDS_INTERVAL_MS     = 1000;
 
-  tempSensor.requestTemperatures();
-  float waterTemp = tempSensor.getTempCByIndex(0);
-  data.waterTemp = (waterTemp == 85.0f || waterTemp == -127.0f) ? -1 : waterTemp;
+// Refresh the cache. Each sensor is rate-limited independently and keeps its last
+// good value in between, so calling this every loop pass is cheap.
+void updateSensorCache() {
+  unsigned long now = millis();
+  latestData.timestamp = now;
 
+  static unsigned long lastDhtMs = 0;
+  if (lastDhtMs == 0 || now - lastDhtMs >= DHT_MIN_INTERVAL_MS) {
+    lastDhtMs = now;
+    float airTemp  = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    // Hold the last good value on a NaN (transient CRC/timing failure) rather
+    // than flapping the display to "--". Both start at -1, so they stay -1 until
+    // the first successful read.
+    if (!isnan(airTemp))  latestData.dhtTemp     = airTemp;
+    if (!isnan(humidity)) latestData.dhtHumidity = humidity;
+  }
+
+  // Non-blocking pattern: read whatever the previous request produced, then kick
+  // off the next conversion. setWaitForConversion(false) in setup() makes
+  // requestTemperatures() return immediately instead of blocking ~750ms.
+  static unsigned long lastDsMs = 0;
+  if (lastDsMs == 0 || now - lastDsMs >= DS18B20_INTERVAL_MS) {
+    lastDsMs = now;
+    float waterTemp = tempSensor.getTempCByIndex(0);
+    latestData.waterTemp = (waterTemp == 85.0f || waterTemp == -127.0f) ? -1 : waterTemp;
+    tempSensor.requestTemperatures();
+  }
+
+  static unsigned long lastTdsMs = 0;
+  if (lastTdsMs == 0 || now - lastTdsMs >= TDS_INTERVAL_MS) {
+    lastTdsMs = now;
+    latestData.tdsPPM  = readTdsPPM();
+    latestData.tdsMScm = latestData.tdsPPM / 640.0f;
+  }
+
+  // Cheap reads, safe every pass.
   // Float switch with INPUT_PULLUP: HIGH means water level is high, LOW means low
-  bool rawFloat = digitalRead(FLOAT_SWITCH_PIN);
-  data.waterLevelHigh = (rawFloat == HIGH);
-  waterLevelHigh = data.waterLevelHigh;
-
-  data.flowRateMlMin = readFlowMlMin();
-  data.tdsPPM = readTdsPPM();
-  data.tdsMScm = data.tdsPPM / 640.0f;
-
-  return data;
+  latestData.waterLevelHigh = (digitalRead(FLOAT_SWITCH_PIN) == HIGH);
+  waterLevelHigh = latestData.waterLevelHigh;
+  latestData.flowRateMlMin = readFlowMlMin();
 }
 
 String buildSensorJson() {
-  SensorData data = readAllSensors();
+  // Uses the cache, not a fresh hardware read: this runs inside an async web
+  // server callback, where a blocking sensor read can trip the task watchdog.
+  const SensorData &data = latestData;
   JsonDocument doc;
   doc["dhtTemperature"] = data.dhtTemp;
   doc["dhtHumidity"] = data.dhtHumidity;
@@ -464,9 +516,9 @@ void updateLCDDisplay() {
   if (now - lastLcdUpdate < LCD_UPDATE_INTERVAL) return;
   lastLcdUpdate = now;
   
-  SensorData data = readAllSensors();
-  
-  // Row 1: Pump status + Water temperature + Auto status
+  SensorData data = latestData;
+
+  // Row 1: Pump status + Auto status
   char row1[17] = {0};
   snprintf(row1, 17, "P:%s A:%s", pumpActive ? "ON " : "OFF", autoPumpEnabled ? "ON" : "OF");
   
@@ -746,43 +798,120 @@ double epochMillis() {
 }
 
 void setupFirebase() {
-  fbConfig.database_url = FIREBASE_DB_URL;
-
-  // The database rules are open, so the device does not sign in and no API key
-  // or Auth account is needed. test_mode makes the library skip token
-  // acquisition instead of failing every request with TOKEN_NOT_READY: it
-  // marks the token ready immediately, and the RTDB layer explicitly allows an
-  // empty token when this flag is set.
-  fbConfig.signer.test_mode = true;
-
-  // Reports token status on serial (addons/TokenHelper.h). Quiet in test mode,
-  // kept so re-enabling authentication doesn't mean re-adding diagnostics.
-  fbConfig.token_status_callback = tokenStatusCallback;
-
-  // v4.4.x switched to BearSSL and needs explicit buffer sizing. Omitting this
-  // produces connection failures and read timeouts that look like network faults.
-  fbdo.setBSSLBufferSize(4096, 1024);
-  fbdo.setResponseSize(4096);
-  ctrlFbdo.setBSSLBufferSize(2048, 1024);
-  ctrlFbdo.setResponseSize(2048);
-
-  Firebase.reconnectNetwork(true);
-  Firebase.begin(&fbConfig, &fbAuth);
-
-  // Heap snapshot at the moment of the first HTTPS connection. BearSSL needs a
-  // large contiguous block (~40KB) for the TLS handshake; if the largest free
-  // block is smaller than that, the SSL layer fails to initialize. If this
-  // prints a low maxAlloc, the async web server is fragmenting the heap and the
-  // fix is to start Firebase before beginning the web server.
+  // Nothing to initialize for REST-over-HTTPS: each call opens its own
+  // WiFiClientSecure with setInsecure(). We only confirm WiFi is up and log a
+  // heap snapshot so a future memory regression is visible at the same spot the
+  // old library's handshake block used to be measured.
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Firebase] WiFi not connected; REST calls will no-op until it is");
+    return;
+  }
   Serial.printf("[Firebase] Heap at connect: free=%u, maxAlloc=%u\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  Serial.println("[Firebase] Connecting (open rules, no sign-in)");
+  Serial.println("[Firebase] Using REST API (open rules, no sign-in)");
+
+  // Reachability probe: GET a small fixed node (not the DB root — that would pull
+  // the entire /sensors/history tree). Returns "null" on a fresh DB or a JSON
+  // body otherwise; either proves the URL, DNS, and TLS all work, so a wrong DB
+  // URL surfaces here at boot rather than as silent write failures later.
+  String probe = firebaseGet("/sensors/live");
+  Serial.printf("[Firebase] Connectivity probe (/sensors/live): %s\n",
+                probe.length() ? probe.substring(0, 60).c_str() : "(no response)");
+}
+
+// ==================== Firebase REST Helpers ====================
+// Each helper opens a short-lived TLS connection with certificate validation
+// disabled (setInsecure). The database rules are open, so no auth token is sent.
+// Returns the HTTP status code, or -1 when WiFi is down / the request never left.
+
+// Builds the full REST URL: <db root> + <path> + ".json".
+static String firebaseUrl(const char *path) {
+  return String(FIREBASE_DB_URL) + String(path) + ".json";
+}
+
+// PUT overwrites the node at `path` wholesale — used for hot single-value state
+// like /sensors/live and /controls/*, so the node never accumulates push keys.
+int firebasePut(const char *path, const String &jsonBody) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, firebaseUrl(path))) return -1;
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(8000);
+  int code = http.sendRequest("PUT", (uint8_t *)jsonBody.c_str(), jsonBody.length());
+  http.end();
+  return code;
+}
+
+// POST appends a child under `path` with a server-generated push key — used for
+// /sensors/history so each sample becomes its own time-ordered row.
+int firebasePost(const char *path, const String &jsonBody) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, firebaseUrl(path))) return -1;
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(8000);
+  int code = http.POST(jsonBody);
+  http.end();
+  return code;
+}
+
+// DELETE removes the node at `path` — used to prune old history rows so the node
+// does not grow without bound.
+int firebaseDelete(const char *path) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, firebaseUrl(path))) return -1;
+  http.setTimeout(8000);
+  int code = http.sendRequest("DELETE");
+  http.end();
+  return code;
+}
+
+// GET returns the response body (JSON) as a String, or "" on any failure. For
+// requests that need a query string, use firebaseGetQuery() below — the RTDB REST
+// API requires the query to come after the ".json" suffix.
+String firebaseGet(const char *path) {
+  if (WiFi.status() != WL_CONNECTED) return "";
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, firebaseUrl(path))) return "";
+  http.addHeader("Accept", "application/json");
+  http.setTimeout(8000);
+  int code = http.GET();
+  String body = "";
+  if (code == 200) body = http.getString();
+  http.end();
+  return body;
+}
+
+// GET variant for query strings. The RTDB REST API needs the query AFTER ".json"
+// (e.g. .../history.json?orderBy="timestamp"&limitToFirst=10), so this builds the
+// URL directly instead of going through firebaseUrl().
+String firebaseGetQuery(const char *path, const String &query) {
+  if (WiFi.status() != WL_CONNECTED) return "";
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String url = String(FIREBASE_DB_URL) + String(path) + ".json?" + query;
+  if (!http.begin(client, url)) return "";
+  http.addHeader("Accept", "application/json");
+  http.setTimeout(8000);
+  int code = http.GET();
+  String body = "";
+  if (code == 200) body = http.getString();
+  http.end();
+  return body;
 }
 
 void updateFirebase(const SensorData &data) {
-  // Firebase.ready() also drives token refresh, so it must be polled, not just
-  // checked. Every database call has to be gated on it.
-  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
 
   unsigned long now = millis();
 
@@ -790,26 +919,34 @@ void updateFirebase(const SensorData &data) {
   if (now - lastFirebasePushMs >= 5000) {
     lastFirebasePushMs = now;
 
-    FirebaseJson json;
-    json.set("dhtTemperature", data.dhtTemp);
-    json.set("dhtHumidity", data.dhtHumidity);
-    json.set("waterTemperature", data.waterTemp);
-    json.set("flowRate", data.flowRateMlMin / 1000.0f);
-    json.set("waterLevel", data.waterLevelHigh ? "HIGH" : "LOW");
-    json.set("tdsPPM", data.tdsPPM);
-    json.set("tdsMScm", data.tdsMScm);
-    json.set("pumpActive", pumpActive);
-    json.set("waterPumpActive", waterPumpActive);
-    json.set("autoPumpEnabled", autoPumpEnabled);
-    json.set("pumpManualOverride", pumpManualOverride);
+    JsonDocument json;
+    json["dhtTemperature"]    = data.dhtTemp;
+    json["dhtHumidity"]       = data.dhtHumidity;
+    json["waterTemperature"]  = data.waterTemp;
+    json["flowRate"]          = data.flowRateMlMin / 1000.0f;
+    json["waterLevel"]        = data.waterLevelHigh ? "HIGH" : "LOW";
+    json["tdsPPM"]            = data.tdsPPM;
+    json["tdsMScm"]           = data.tdsMScm;
+    json["pumpActive"]        = pumpActive;
+    json["waterPumpActive"]   = waterPumpActive;
+    json["autoPumpEnabled"]   = autoPumpEnabled;
+    json["pumpManualOverride"] = pumpManualOverride;
     // Thresholds travel with the payload so the dashboard shows the values the
     // device is actually using instead of falling back to hardcoded text.
-    json.set("ecLower", EC_LOWER);
-    json.set("ecUpper", EC_UPPER);
-    json.set("timestamp", epochMillis());
+    json["ecLower"]           = EC_LOWER;
+    json["ecUpper"]           = EC_UPPER;
+    // Epoch-ms is ~1.75e12: serialize as a 64-bit integer, not a double.
+    // ArduinoJson renders large doubles in reduced precision (e.g. 1.75468e12),
+    // which would round the timestamp by ~1e5 ms and break the dashboard's
+    // 45-second freshness check and chart axis.
+    json["timestamp"]         = (long long)epochMillis();
 
-    if (!Firebase.setJSON(fbdo, "/sensors/live", json)) {
-      Serial.printf("[Firebase ERROR] %s\n", fbdo.errorReason().c_str());
+    String body;
+    serializeJson(json, body);
+    // PUT overwrites /sensors/live so the node stays a single hot record.
+    int code = firebasePut("/sensors/live", body);
+    if (code != 200) {
+      Serial.printf("[Firebase ERROR] live push HTTP %d\n", code);
     }
   }
 
@@ -826,17 +963,23 @@ void updateFirebase(const SensorData &data) {
       return;
     }
 
-    FirebaseJson json;
-    json.set("dhtTemperature", data.dhtTemp);
-    json.set("dhtHumidity", data.dhtHumidity);
-    json.set("waterTemperature", data.waterTemp);
-    json.set("flowRate", data.flowRateMlMin / 1000.0f);
-    json.set("waterLevel", data.waterLevelHigh ? "HIGH" : "LOW");
-    json.set("waterLevelValue", data.waterLevelHigh ? 1 : 0);
-    json.set("tdsMScm", data.tdsMScm);
-    json.set("timestamp", ts);
+    JsonDocument json;
+    json["dhtTemperature"]   = data.dhtTemp;
+    json["dhtHumidity"]      = data.dhtHumidity;
+    json["waterTemperature"] = data.waterTemp;
+    json["flowRate"]         = data.flowRateMlMin / 1000.0f;
+    json["waterLevel"]       = data.waterLevelHigh ? "HIGH" : "LOW";
+    json["waterLevelValue"]  = data.waterLevelHigh ? 1 : 0;
+    json["tdsMScm"]          = data.tdsMScm;
+    json["timestamp"]        = (long long)ts;   // integer epoch-ms, see live push
 
-    Firebase.pushJSON(fbdo, "/sensors/history", json);
+    String body;
+    serializeJson(json, body);
+    // POST appends a push-keyed child under /sensors/history.
+    int code = firebasePost("/sensors/history", body);
+    if (code != 200) {
+      Serial.printf("[Firebase] History push HTTP %d\n", code);
+    }
   }
 
   pruneFirebaseHistory();
@@ -848,7 +991,7 @@ void updateFirebase(const SensorData &data) {
 // and download quota for data nobody charts. Trim anything past the retention
 // window, a few rows at a time so a delete pass never blocks the control loop.
 void pruneFirebaseHistory() {
-  if (!Firebase.ready()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
 
   unsigned long now = millis();
   if (now - lastPruneMs < HISTORY_PRUNE_INTERVAL_MS) return;
@@ -859,47 +1002,39 @@ void pruneFirebaseHistory() {
   double cutoff = nowMs - (double)HISTORY_RETENTION_DAYS * 86400000.0;
   if (cutoff <= 0) return;
 
-  // Oldest-first, capped batch. Needs .indexOn:["timestamp"] in the rules,
-  // which database.rules.json declares.
-  // Uses fbdo, not ctrlFbdo: this response is ~2KB and ctrlFbdo is deliberately
-  // sized small (2KB) for tiny control reads. Safe because pruning runs
-  // sequentially right after the sensor push, never interleaved with it.
-  QueryFilter q;
-  q.orderBy("timestamp").endAt(cutoff).limitToFirst(HISTORY_PRUNE_BATCH);
+  // Oldest-first, capped batch via the RTDB REST query API. Needs
+  // .indexOn:["timestamp"] in the rules, which database.rules.json declares.
+  // orderBy value must be a quoted JSON string per the REST spec.
+  String query = "orderBy=%22timestamp%22&endAt=" + String((long long)cutoff) +
+                 "&limitToFirst=" + String(HISTORY_PRUNE_BATCH);
+  String body = firebaseGetQuery("/sensors/history", query);
+  if (body.length() == 0 || body == "null") return;  // nothing older than window
 
-  if (!Firebase.getJSON(fbdo, "/sensors/history", q)) {
-    Serial.printf("[Prune] Query failed: %s\n", fbdo.errorReason().c_str());
-    q.clear();
+  // Parse the returned object: { "-Nxxx": {..., "timestamp": ...}, ... }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("[Prune] Parse failed: %s\n", err.c_str());
     return;
   }
-  q.clear();
+  JsonObject obj = doc.as<JsonObject>();
+  if (obj.isNull()) return;
 
-  FirebaseJson &result = fbdo.jsonObject();
-  size_t count = result.iteratorBegin();
-  if (count == 0) {
-    result.iteratorEnd();
-    return;   // nothing older than the window
-  }
-
-  // Collect keys first. Deleting while iterating would invalidate the iterator.
+  // Collect keys first, then delete. Every RTDB push key begins with '-', so a
+  // stray sensor field could never be mistaken for a row key.
   String keys[HISTORY_PRUNE_BATCH];
   int found = 0;
-  for (size_t i = 0; i < count && found < HISTORY_PRUNE_BATCH; i++) {
-    FirebaseJson::IteratorValue item = result.valueAt(i);
-    // Two independent guards, because deleting the wrong path here would throw
-    // away good data: depth 0 is the top level where rows live, and every RTDB
-    // push key begins with '-'. A sensor field like "timestamp" satisfies
-    // neither, so the worst case is that a pass deletes nothing.
-    if (item.depth == 0 && item.key.length() > 1 && item.key[0] == '-') {
-      keys[found++] = item.key;
+  for (JsonPair kv : obj) {
+    const char *k = kv.key().c_str();
+    if (found < HISTORY_PRUNE_BATCH && k && k[0] == '-') {
+      keys[found++] = String(k);
     }
   }
-  result.iteratorEnd();
 
   int deleted = 0;
   for (int i = 0; i < found; i++) {
     String path = "/sensors/history/" + keys[i];
-    if (Firebase.deleteNode(fbdo, path.c_str())) deleted++;
+    if (firebaseDelete(path.c_str()) == 200) deleted++;
     else Serial.printf("[Prune] Delete failed for %s\n", keys[i].c_str());
   }
 
@@ -918,26 +1053,30 @@ void pruneFirebaseHistory() {
 
 // Reads a {state, ts} command node. Returns false if absent or malformed.
 bool readCommand(const char *path, String &state, double &ts) {
-  if (!Firebase.getJSON(ctrlFbdo, path)) return false;
+  String body = firebaseGet(path);
+  if (body.length() == 0 || body == "null") return false;
 
-  FirebaseJson &json = ctrlFbdo.jsonObject();
-  FirebaseJsonData stateData;
-  FirebaseJsonData tsData;
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return false;
 
-  if (!json.get(stateData, "state") || !json.get(tsData, "ts")) return false;
+  JsonVariant stateVar = doc["state"];
+  JsonVariant tsVar     = doc["ts"];
+  if (stateVar.isNull() || tsVar.isNull()) return false;
 
-  state = stateData.stringValue;
+  state = String((const char *)(stateVar.as<const char *>() ? stateVar.as<const char *>() : ""));
   state.toLowerCase();
   state.trim();
-  ts = tsData.doubleValue;
+  ts = tsVar.as<double>();
   return state.length() > 0;
 }
 
 bool writeCommand(const char *path, const char *state, double ts) {
-  FirebaseJson json;
-  json.set("state", state);
-  json.set("ts", ts);
-  return Firebase.setJSON(ctrlFbdo, path, json);
+  JsonDocument doc;
+  doc["state"] = state;
+  doc["ts"]    = (long long)ts;   // integer epoch-ms, avoids double rounding
+  String body;
+  serializeJson(doc, body);
+  return firebasePut(path, body) == 200;
 }
 
 // Force both pumps off in the database before we start obeying it, so a command
@@ -966,7 +1105,7 @@ void armControls() {
   ok &= writeCommand("/controls/autoPump", autoPumpEnabled ? "enable" : "disable", armTs);
 
   if (!ok) {
-    Serial.printf("[Firebase] Boot arming failed: %s\n", ctrlFbdo.errorReason().c_str());
+    Serial.println("[Firebase] Boot arming failed: one or more control writes did not return 200");
     return;  // retry on the next poll rather than obeying stale commands
   }
 
@@ -979,30 +1118,33 @@ void armControls() {
 }
 
 void pollFirebaseGsm() {
-  if (!Firebase.getJSON(ctrlFbdo, "/gsm")) return;
+  String body = firebaseGet("/gsm");
+  if (body.length() == 0 || body == "null") return;
 
-  FirebaseJson &json = ctrlFbdo.jsonObject();
-  FirebaseJsonData phoneData, msgData, enabledData;
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return;
 
   bool changed = false;
-  if (json.get(phoneData, "phoneNumber")) {
-    String phone = phoneData.stringValue;
+  if (!doc["phoneNumber"].isNull()) {
+    String phone = String((const char *)(doc["phoneNumber"].as<const char *>() ?
+                                          doc["phoneNumber"].as<const char *>() : ""));
     phone.trim();
     if (phone.length() >= 5 && phone != gsmPhoneNumber) {
       gsmPhoneNumber = phone;
       changed = true;
     }
   }
-  if (json.get(msgData, "message")) {
-    String msg = msgData.stringValue;
+  if (!doc["message"].isNull()) {
+    String msg = String((const char *)(doc["message"].as<const char *>() ?
+                                        doc["message"].as<const char *>() : ""));
     msg.trim();
     if (msg.length() > 0 && msg != gsmAlertMessage) {
       gsmAlertMessage = msg;
       changed = true;
     }
   }
-  if (json.get(enabledData, "enabled")) {
-    bool en = enabledData.boolValue;
+  if (!doc["enabled"].isNull()) {
+    bool en = doc["enabled"].as<bool>();
     if (en != gsmEnabled) {
       gsmEnabled = en;
       changed = true;
@@ -1017,7 +1159,7 @@ void pollFirebaseGsm() {
 }
 
 void pollFirebaseControls() {
-  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
 
   unsigned long now = millis();
   if (now - lastFirebaseControlMs < 2000) return;  // Poll every 2 seconds
@@ -1092,6 +1234,11 @@ void setup() {
 
   dht.begin();
   tempSensor.begin();
+  // Non-blocking conversions: requestTemperatures() returns immediately instead
+  // of stalling the loop ~750ms while the DS18B20 converts. updateSensorCache()
+  // reads the previous result before requesting the next one.
+  tempSensor.setWaitForConversion(false);
+  tempSensor.requestTemperatures();   // prime the first conversion
   attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), flowISR, RISING);
   lastFlowCalcMs = millis();
 
@@ -1121,13 +1268,15 @@ void loop() {
       now - waterPumpOnSinceMs >= WATER_PUMP_MAX_ON_MS) {
     Serial.println("[SAFETY] Water pump hit max runtime. Forcing OFF.");
     setWaterPump(false);
-    if (Firebase.ready()) {
+    if (WiFi.status() == WL_CONNECTED) {
       writeCommand("/controls/waterPump", "off", epochMillis());
       lastAppliedWaterPumpTs = epochMillis();
     }
   }
   
-  SensorData data = readAllSensors();
+  // Refresh the sensor cache once per pass; every other consumer reads from it.
+  updateSensorCache();
+  SensorData data = latestData;
   checkFloatSwitchAlert(data.waterLevelHigh);
   updateFirebase(data);
   pollFirebaseControls();  // Handle remote commands from Netlify dashboard
@@ -1175,7 +1324,7 @@ void loop() {
     Serial.printf("Water Temp: %.2f C\n", data.waterTemp);
     Serial.printf("Flow: %.2f mL/min\n", data.flowRateMlMin);
     Serial.printf("Water Level: %s\n", data.waterLevelHigh ? "HIGH" : "LOW");
-    Serial.printf("TDS: %.2f PPM (%.2f mS/cm)\n", data.tdsPPM, data.tdsMScm);
+    Serial.printf("TDS: %.2f PPM (%.2f mS/cm) [raw ADC: %d]\n", data.tdsPPM, data.tdsMScm, lastTdsRawADC);
     Serial.printf("Pump: %s (Auto: %s, Manual Override: %s)\n", 
                   pumpActive ? "ON" : "OFF", 
                   autoPumpEnabled ? "enabled" : "disabled",
@@ -1184,7 +1333,7 @@ void loop() {
   }
   
   // Heap trend. A steady decline here means something is leaking — this is how
-  // the per-poll FirebaseData allocation showed up before it was made global.
+  // a per-request allocation regression would show up over time.
   if (millis() - lastHeapLogMs >= 60000) {
     lastHeapLogMs = millis();
     Serial.printf("[HEAP] free=%u bytes, largest block=%u, uptime=%lus\n",
