@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Local credentials — never commit.
+# Copy include/secrets.example.h to include/secrets.h and fill it in.
+include/secrets.h

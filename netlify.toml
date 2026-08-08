@@ -12,6 +12,8 @@
     X-Frame-Options = "DENY"
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "strict-origin-when-cross-origin"
+    # The page never uses these APIs, so opt out of them.
+    Permissions-Policy = "geolocation=(), camera=(), microphone=()"
 
 [[headers]]
   for = "/*.js"
@@ -23,8 +25,8 @@
   [headers.values]
     Cache-Control = "public, max-age=3600"
 
-# SPA-style fallback: all routes serve index.html
-[[redirects]]
-  from = "/*"
-  to = "/index.html"
-  status = 200
+# No SPA fallback, deliberately. This is a single page backed by real files, so a
+# catch-all "/*" -> /index.html 200 would mask genuine failures: a missing or
+# mistyped script.js would return the HTML page with status 200, the browser
+# would reject it as the wrong MIME type, and you'd get a blank dashboard with
+# no 404 anywhere to point at the cause. Netlify already serves index.html at "/".

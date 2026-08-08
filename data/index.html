@@ -6,8 +6,14 @@
     <title>ESP32 Greenhouse Command Center | Hydroponics Monitoring</title>
     <meta name="description" content="Real-time hydroponic system dashboard — live sensor readings, historical charts, and pump control for your ESP32 Dutch bucket greenhouse.">
     <link rel="stylesheet" href="style.css">
-    <script src="https://cdn.jsdelivr.net/npm/apexcharts@latest"></script>
-    <!-- Firebase JS SDK -->
+    <!-- Pinned deliberately. This was "apexcharts@latest", which silently adopts
+         every future major release — ApexCharts shipped 6.0 with breaking changes
+         in July 2026, and an unattended greenhouse dashboard should not change
+         behaviour on its own. 6.7.0 is what @latest resolved to when this was
+         set, so nothing changes today; bump it intentionally after testing. -->
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts@6.7.0"></script>
+    <!-- Firebase JS SDK. No auth module: the database rules are open, so there
+         is no sign-in and the database SDK needs only the databaseURL. -->
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
 </head>

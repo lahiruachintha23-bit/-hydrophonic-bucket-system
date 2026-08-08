@@ -1,0 +1,74 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "sensors": {
+      "live": {
+        ".read": true,
+        ".write": true,
+        ".validate": "newData.hasChild('timestamp')",
+        "timestamp": {
+          ".validate": "newData.isNumber()"
+        },
+        "waterLevel": {
+          ".validate": "newData.isString() && newData.val().length <= 8"
+        }
+      },
+      "history": {
+        ".read": true,
+        ".write": true,
+        ".indexOn": ["timestamp"],
+        "$row": {
+          ".validate": "newData.hasChild('timestamp')",
+          "timestamp": {
+            ".validate": "newData.isNumber()"
+          },
+          "waterLevel": {
+            ".validate": "newData.isString() && newData.val().length <= 8"
+          }
+        }
+      }
+    },
+
+    "controls": {
+      ".read": true,
+
+      "$control": {
+        ".write": "newData.exists()",
+        ".validate": "($control === 'pump' || $control === 'autoPump' || $control === 'waterPump') && newData.hasChildren(['state', 'ts'])",
+        "state": {
+          ".validate": "newData.isString() && newData.val().length <= 16"
+        },
+        "ts": {
+          ".validate": "newData.isNumber()"
+        },
+        "$other": {
+          ".validate": false
+        }
+      }
+    },
+
+    "gsm": {
+      ".read": true,
+      ".write": "newData.exists()",
+      "phoneNumber": {
+        ".validate": "newData.isString() && newData.val().length <= 20"
+      },
+      "message": {
+        ".validate": "newData.isString() && newData.val().length <= 140"
+      },
+      "enabled": {
+        ".validate": "newData.isBoolean()"
+      },
+      "$other": {
+        ".validate": false
+      }
+    },
+
+    "device": {
+      ".read": true,
+      ".write": true
+    }
+  }
+}

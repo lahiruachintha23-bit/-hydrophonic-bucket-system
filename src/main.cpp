@@ -11,24 +11,55 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <FirebaseESP32.h>
+#include <addons/TokenHelper.h>
+#include <time.h>
+#include "secrets.h"
 
-// ==================== Firebase Configuration ====================
-#define FIREBASE_HOST "https://hydrophonic-bucket-system-default-rtdb.asia-southeast1.firebasedatabase.app/"
-#define FIREBASE_AUTH ""  // Add Database Secret if Auth is required
-
-FirebaseData fbdo;
+// ==================== Firebase ====================
+FirebaseData fbdo;      // sensor writes
+FirebaseData ctrlFbdo;  // control reads — must stay global; each FirebaseData
+                        // owns a large TLS buffer, so creating one per poll
+                        // fragments the heap and re-handshakes every time.
 FirebaseAuth fbAuth;
 FirebaseConfig fbConfig;
+
 unsigned long lastFirebasePushMs = 0;
 unsigned long lastFirebaseHistoryMs = 0;
 unsigned long lastFirebaseControlMs = 0;
-String lastPumpCommand      = "";
-String lastAutoPumpCommand  = "";
-String lastWaterPumpCommand = "";
+unsigned long lastHeapLogMs = 0;
+unsigned long lastPruneMs = 0;
 
-// ==================== WiFi Configuration ====================
-const char* ssid = "Infinix NOTE 40";
-const char* password = "Achi@234";
+// History retention. A row every 60s is ~1440/day and nothing removed them, so
+// the node grew forever. Keep a rolling window and delete in small batches.
+// Rate matters: the batch/interval pair must exceed 1440 deletions/day or the
+// backlog grows forever. 10 rows every 5 min = 2880/day, ~2x headroom, and keeps
+// the query response near 2KB so it fits the session's buffer.
+#define HISTORY_RETENTION_DAYS     30
+#define HISTORY_PRUNE_BATCH        10      // rows per pass (also sizes an array)
+const unsigned long HISTORY_PRUNE_INTERVAL_MS = 300000UL;  // 5 minutes
+
+void pruneFirebaseHistory();   // defined below updateFirebase, called from it
+
+// Commands are {state, ts} objects. Tracking the ts we last acted on means a
+// command applies exactly once, repeat presses still register (new ts), and a
+// stale command left in the database cannot restart a pump after a reboot.
+double lastAppliedPumpTs      = 0;
+double lastAppliedAutoPumpTs  = 0;
+double lastAppliedWaterPumpTs = 0;
+bool   controlsArmed          = false;  // true once boot-safe defaults are written
+
+// ==================== WiFi ====================
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+
+// ==================== Time (NTP) ====================
+// millis() is uptime, not wall clock. History rows need real epoch time or the
+// dashboard renders every point in 1970 and the axis resets on each reboot.
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.google.com";
+const long  GMT_OFFSET_SEC = 5 * 3600 + 30 * 60;  // Asia/Colombo, UTC+05:30
+const int   DAYLIGHT_OFFSET_SEC = 0;
+bool timeSynced = false;
 
 // ==================== GPIO Pin Assignments ====================
 #define DHT_PIN 4            // DHT22 sensor
@@ -41,7 +72,7 @@ const char* password = "Achi@234";
 #define GSM_RX_PIN 16        // GSM module RX pin (to module TX)
 #define GSM_TX_PIN 17        // GSM module TX pin (to module RX)
 #define GSM_BAUD 9600
-#define DEFAULT_GSM_PHONE "+94740879724"
+#define DEFAULT_GSM_PHONE GSM_PHONE_NUMBER
 #define DEFAULT_GSM_MESSAGE "Water level is LOW"
 #define I2C_SDA 21           // I2C Data line for LCD
 #define I2C_SCL 22           // I2C Clock line for LCD
@@ -52,6 +83,11 @@ const float EC_UPPER = 2.8f;         // Pump turns OFF when EC reaches this
 const unsigned long MIN_PUMP_ON_MS = 10000;  // Minimum pump run time (10s)
 const unsigned long MIN_PUMP_OFF_MS = 10000; // Minimum pump off time (10s)
 const unsigned long MANUAL_OVERRIDE_TIMEOUT_MS = 300000; // Manual override timeout (5 min)
+
+// The water pump has no EC feedback loop to switch it off again, so a remote
+// "on" would otherwise run until someone noticed. Cap it.
+const unsigned long WATER_PUMP_MAX_ON_MS = 30UL * 60UL * 1000UL;  // 30 minutes
+unsigned long waterPumpOnSinceMs = 0;
 
 const bool RELAY_ACTIVE_LOW = true;   // Most relay boards are active LOW
 const float FLOW_PULSES_PER_LITER = 450.0f; // Approx. YF-S201: 7.5 pulses/sec = 1 L/min => 450 pulses/L
@@ -134,8 +170,10 @@ void setWaterPump(bool turnOn) {
   waterPumpActive = turnOn;
   setRelayState(WATER_PUMP_PIN, turnOn);
   if (turnOn) {
+    waterPumpOnSinceMs = millis();
     Serial.println("[WATER PUMP ON]");
   } else {
+    waterPumpOnSinceMs = 0;
     Serial.println("[WATER PUMP OFF]");
   }
 }
@@ -354,7 +392,10 @@ String buildSensorJson() {
   doc["dhtTemperature"] = data.dhtTemp;
   doc["dhtHumidity"] = data.dhtHumidity;
   doc["waterTemperature"] = data.waterTemp;
-  doc["flowRate"] = data.flowRateMlMin;
+  // L/min, matching the Firebase payload and the dashboard's label. This used
+  // to emit mL/min here while Firebase sent L/min, so local mode read 1000x high.
+  doc["flowRate"] = data.flowRateMlMin / 1000.0f;
+  doc["flowRateMlMin"] = data.flowRateMlMin;
   doc["waterLevel"] = data.waterLevelHigh ? "HIGH" : "LOW";
   doc["waterLevelValue"] = data.waterLevelHigh ? 1 : 0;
   doc["tdsPPM"] = data.tdsPPM;
@@ -383,6 +424,9 @@ void sendStatusJson(AsyncWebServerRequest *request) {
   doc["status"] = "ok";
   doc["pump"] = pumpActive ? "on" : "off";
   doc["waterPump"] = waterPumpActive ? "on" : "off";
+  // The dashboard's checkStatus() reads waterPumpActive; emitting only
+  // "waterPump" here meant the water pump always displayed OFF.
+  doc["waterPumpActive"] = waterPumpActive ? "on" : "off";
   doc["autoPump"] = autoPumpEnabled ? "enabled" : "disabled";
   doc["pumpManualOverride"] = pumpManualOverride ? "active" : "inactive";
   doc["waterLevel"] = waterLevelHigh ? "HIGH" : "LOW";
@@ -453,6 +497,23 @@ bool getStringParam(AsyncWebServerRequest *request, const char *name, String &va
   return true;
 }
 
+// Normalize various action synonyms to canonical values: "enable" or "disable".
+// Returns empty string when the action is not recognized.
+String normalizeAction(const String &raw) {
+  String s = raw;
+  s.toLowerCase();
+  s.trim();
+  if (s.length() == 0) return String("");
+
+  if (s.startsWith("e") || s == "enable" || s == "enabled" || s == "on" || s == "1" || s == "true") {
+    return String("enable");
+  }
+  if (s.startsWith("d") || s == "disable" || s == "disabled" || s == "off" || s == "0" || s == "false") {
+    return String("disable");
+  }
+  return String("");
+}
+
 // ==================== Web Server ====================
 void setupWebServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -508,22 +569,20 @@ void setupWebServer() {
       request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing action parameter\"}");
       return;
     }
-
-    // Check first character (case already converted to lowercase)
-    if (action.length() > 0) {
-      if (action[0] == 'e') {  // 'enable' starts with 'e'
-        setAutoPump(true);
-        pumpManualOverride = false;
-      } else if (action[0] == 'd') {  // 'disable' starts with 'd'
-        setAutoPump(false);
-        pumpManualOverride = false;
-      } else {
-        request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid action\"}");
-        return;
-      }
-    } else {
-      request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid action\"}");
+    // Normalize action values to accepted canonical values
+    String norm = normalizeAction(action);
+    if (norm.length() == 0) {
+      Serial.printf("[API] Invalid auto pump action received: '%s'\n", action.c_str());
+      request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid action\",\"accepted\":[\"enable\",\"disable\"]}");
       return;
+    }
+
+    if (norm == "enable") {
+      setAutoPump(true);
+      pumpManualOverride = false;
+    } else { // "disable"
+      setAutoPump(false);
+      pumpManualOverride = false;
     }
     sendStatusJson(request);
   });
@@ -641,17 +700,68 @@ void setupWiFi() {
   }
 }
 
+void setupTime() {
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
+  Serial.print("[NTP] Syncing clock");
+  struct tm timeinfo;
+  for (int i = 0; i < 20 && !timeSynced; i++) {
+    if (getLocalTime(&timeinfo, 500)) {
+      timeSynced = true;
+      break;
+    }
+    Serial.print('.');
+  }
+  if (timeSynced) {
+    Serial.printf("\n[NTP] Synced: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  } else {
+    Serial.println("\n[NTP] Sync failed; will retry in the background");
+  }
+}
+
+// Epoch milliseconds, for timestamps the dashboard can plot directly.
+// Returns 0 until the clock is actually valid, so callers can skip writing a
+// point rather than logging one that renders in 1970.
+double epochMillis() {
+  time_t nowSec = time(nullptr);
+  if (nowSec < 1700000000) return 0;   // still pre-sync
+  timeSynced = true;
+  return (double)nowSec * 1000.0;
+}
+
 void setupFirebase() {
-  fbConfig.database_url = FIREBASE_HOST;
-  fbConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
+  fbConfig.database_url = FIREBASE_DB_URL;
+
+  // The database rules are open, so the device does not sign in and no API key
+  // or Auth account is needed. test_mode makes the library skip token
+  // acquisition instead of failing every request with TOKEN_NOT_READY: it
+  // marks the token ready immediately, and the RTDB layer explicitly allows an
+  // empty token when this flag is set.
+  fbConfig.signer.test_mode = true;
+
+  // Reports token status on serial (addons/TokenHelper.h). Quiet in test mode,
+  // kept so re-enabling authentication doesn't mean re-adding diagnostics.
+  fbConfig.token_status_callback = tokenStatusCallback;
+
+  // v4.4.x switched to BearSSL and needs explicit buffer sizing. Omitting this
+  // produces connection failures and read timeouts that look like network faults.
+  fbdo.setBSSLBufferSize(4096, 1024);
+  fbdo.setResponseSize(4096);
+  ctrlFbdo.setBSSLBufferSize(2048, 1024);
+  ctrlFbdo.setResponseSize(2048);
+
+  Firebase.reconnectNetwork(true);
   Firebase.begin(&fbConfig, &fbAuth);
-  Firebase.reconnectWiFi(true);
-  Serial.println("[Firebase] Realtime Database configured");
+
+  Serial.println("[Firebase] Connecting (open rules, no sign-in)");
 }
 
 void updateFirebase(const SensorData &data) {
-  if (WiFi.status() != WL_CONNECTED) return;
-  
+  // Firebase.ready() also drives token refresh, so it must be polled, not just
+  // checked. Every database call has to be gated on it.
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+
   unsigned long now = millis();
 
   // Push live sensor state to Firebase every 5 seconds
@@ -670,7 +780,11 @@ void updateFirebase(const SensorData &data) {
     json.set("waterPumpActive", waterPumpActive);
     json.set("autoPumpEnabled", autoPumpEnabled);
     json.set("pumpManualOverride", pumpManualOverride);
-    json.set("timestamp", millis());
+    // Thresholds travel with the payload so the dashboard shows the values the
+    // device is actually using instead of falling back to hardcoded text.
+    json.set("ecLower", EC_LOWER);
+    json.set("ecUpper", EC_UPPER);
+    json.set("timestamp", epochMillis());
 
     if (!Firebase.setJSON(fbdo, "/sensors/live", json)) {
       Serial.printf("[Firebase ERROR] %s\n", fbdo.errorReason().c_str());
@@ -679,7 +793,16 @@ void updateFirebase(const SensorData &data) {
 
   // Push historical log entry every 60 seconds
   if (now - lastFirebaseHistoryMs >= 60000) {
-    lastFirebaseHistoryMs = now;
+    lastFirebaseHistoryMs = now;   // reset first, so a skip retries in 60s
+                                   // rather than spinning every loop tick
+
+    double ts = epochMillis();
+    // Skip logging until the clock is real. A point written with uptime instead
+    // of epoch time plots in 1970 and corrupts the chart's axis.
+    if (ts == 0) {
+      Serial.println("[Firebase] Skipping history row: clock not synced yet");
+      return;
+    }
 
     FirebaseJson json;
     json.set("dhtTemperature", data.dhtTemp);
@@ -687,74 +810,243 @@ void updateFirebase(const SensorData &data) {
     json.set("waterTemperature", data.waterTemp);
     json.set("flowRate", data.flowRateMlMin / 1000.0f);
     json.set("waterLevel", data.waterLevelHigh ? "HIGH" : "LOW");
+    json.set("waterLevelValue", data.waterLevelHigh ? 1 : 0);
     json.set("tdsMScm", data.tdsMScm);
-    json.set("timestamp", millis());
+    json.set("timestamp", ts);
 
     Firebase.pushJSON(fbdo, "/sensors/history", json);
+  }
+
+  pruneFirebaseHistory();
+}
+
+// ==================== History Retention ====================
+// A row is logged every 60s and nothing ever removed it, so /sensors/history grew
+// without bound (~1440 rows/day, ~525k/year). That slowly inflates stored bytes
+// and download quota for data nobody charts. Trim anything past the retention
+// window, a few rows at a time so a delete pass never blocks the control loop.
+void pruneFirebaseHistory() {
+  if (!Firebase.ready()) return;
+
+  unsigned long now = millis();
+  if (now - lastPruneMs < HISTORY_PRUNE_INTERVAL_MS) return;
+  lastPruneMs = now;
+
+  double nowMs = epochMillis();
+  if (nowMs == 0) return;  // clock not synced; cutoff would be meaningless
+  double cutoff = nowMs - (double)HISTORY_RETENTION_DAYS * 86400000.0;
+  if (cutoff <= 0) return;
+
+  // Oldest-first, capped batch. Needs .indexOn:["timestamp"] in the rules,
+  // which database.rules.json declares.
+  // Uses fbdo, not ctrlFbdo: this response is ~2KB and ctrlFbdo is deliberately
+  // sized small (2KB) for tiny control reads. Safe because pruning runs
+  // sequentially right after the sensor push, never interleaved with it.
+  QueryFilter q;
+  q.orderBy("timestamp").endAt(cutoff).limitToFirst(HISTORY_PRUNE_BATCH);
+
+  if (!Firebase.getJSON(fbdo, "/sensors/history", q)) {
+    Serial.printf("[Prune] Query failed: %s\n", fbdo.errorReason().c_str());
+    q.clear();
+    return;
+  }
+  q.clear();
+
+  FirebaseJson &result = fbdo.jsonObject();
+  size_t count = result.iteratorBegin();
+  if (count == 0) {
+    result.iteratorEnd();
+    return;   // nothing older than the window
+  }
+
+  // Collect keys first. Deleting while iterating would invalidate the iterator.
+  String keys[HISTORY_PRUNE_BATCH];
+  int found = 0;
+  for (size_t i = 0; i < count && found < HISTORY_PRUNE_BATCH; i++) {
+    FirebaseJson::IteratorValue item = result.valueAt(i);
+    // Two independent guards, because deleting the wrong path here would throw
+    // away good data: depth 0 is the top level where rows live, and every RTDB
+    // push key begins with '-'. A sensor field like "timestamp" satisfies
+    // neither, so the worst case is that a pass deletes nothing.
+    if (item.depth == 0 && item.key.length() > 1 && item.key[0] == '-') {
+      keys[found++] = item.key;
+    }
+  }
+  result.iteratorEnd();
+
+  int deleted = 0;
+  for (int i = 0; i < found; i++) {
+    String path = "/sensors/history/" + keys[i];
+    if (Firebase.deleteNode(fbdo, path.c_str())) deleted++;
+    else Serial.printf("[Prune] Delete failed for %s\n", keys[i].c_str());
+  }
+
+  if (deleted > 0) {
+    Serial.printf("[Prune] Removed %d history rows older than %d days\n",
+                  deleted, HISTORY_RETENTION_DAYS);
   }
 }
 
 // ==================== Remote Control via Firebase (Netlify → ESP32) ====================
+// Commands are {state:"on"|"off", ts:<epoch ms>} objects rather than bare
+// strings. Comparing the timestamp instead of the string value means:
+//   - pressing the same button twice still registers (the ts changes), and
+//   - a stale command sitting in the database cannot re-fire after a reboot,
+//     because boot writes fresh "off" defaults before polling begins.
+
+// Reads a {state, ts} command node. Returns false if absent or malformed.
+bool readCommand(const char *path, String &state, double &ts) {
+  if (!Firebase.getJSON(ctrlFbdo, path)) return false;
+
+  FirebaseJson &json = ctrlFbdo.jsonObject();
+  FirebaseJsonData stateData;
+  FirebaseJsonData tsData;
+
+  if (!json.get(stateData, "state") || !json.get(tsData, "ts")) return false;
+
+  state = stateData.stringValue;
+  state.toLowerCase();
+  state.trim();
+  ts = tsData.doubleValue;
+  return state.length() > 0;
+}
+
+bool writeCommand(const char *path, const char *state, double ts) {
+  FirebaseJson json;
+  json.set("state", state);
+  json.set("ts", ts);
+  return Firebase.setJSON(ctrlFbdo, path, json);
+}
+
+// Force both pumps off in the database before we start obeying it, so a command
+// left over from before a power cut can never restart a pump unattended.
+void armControls() {
+  double ts = epochMillis();
+  if (ts == 0) return;  // wait for a real clock so the ts ordering is meaningful
+
+  // Backdate the boot stamp slightly. The watermark below is set from the ESP32's
+  // NTP clock, but dashboard commands are stamped by Firebase's server clock, and
+  // the two can disagree by a second or so. If NTP ran ahead, a button pressed
+  // right after boot would carry an earlier ts and be silently ignored. Nudging
+  // the stamp into the past closes that window and costs nothing: these writes
+  // OVERWRITE whatever stale command was stored, so no old command survives to be
+  // re-applied. Written value and watermark must stay equal, otherwise the device
+  // re-reads its own "off" next poll and that would set pumpManualOverride,
+  // suppressing auto-dosing after every boot.
+  const double ARM_SKEW_MARGIN_MS = 10000.0;
+  double armTs = ts - ARM_SKEW_MARGIN_MS;
+
+  setPump(false);
+  setWaterPump(false);
+
+  bool ok = writeCommand("/controls/pump", "off", armTs);
+  ok &= writeCommand("/controls/waterPump", "off", armTs);
+  ok &= writeCommand("/controls/autoPump", autoPumpEnabled ? "enable" : "disable", armTs);
+
+  if (!ok) {
+    Serial.printf("[Firebase] Boot arming failed: %s\n", ctrlFbdo.errorReason().c_str());
+    return;  // retry on the next poll rather than obeying stale commands
+  }
+
+  // Treat these as already applied so we don't immediately re-act on them.
+  lastAppliedPumpTs = armTs;
+  lastAppliedWaterPumpTs = armTs;
+  lastAppliedAutoPumpTs = armTs;
+  controlsArmed = true;
+  Serial.println("[Firebase] Controls armed: pumps forced OFF at boot");
+}
+
+void pollFirebaseGsm() {
+  if (!Firebase.getJSON(ctrlFbdo, "/gsm")) return;
+
+  FirebaseJson &json = ctrlFbdo.jsonObject();
+  FirebaseJsonData phoneData, msgData, enabledData;
+
+  bool changed = false;
+  if (json.get(phoneData, "phoneNumber")) {
+    String phone = phoneData.stringValue;
+    phone.trim();
+    if (phone.length() >= 5 && phone != gsmPhoneNumber) {
+      gsmPhoneNumber = phone;
+      changed = true;
+    }
+  }
+  if (json.get(msgData, "message")) {
+    String msg = msgData.stringValue;
+    msg.trim();
+    if (msg.length() > 0 && msg != gsmAlertMessage) {
+      gsmAlertMessage = msg;
+      changed = true;
+    }
+  }
+  if (json.get(enabledData, "enabled")) {
+    bool en = enabledData.boolValue;
+    if (en != gsmEnabled) {
+      gsmEnabled = en;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveGsmSettings();
+    Serial.printf("[Firebase] GSM settings updated remotely: enabled=%s, phone=%s\n",
+                  gsmEnabled ? "true" : "false", gsmPhoneNumber.c_str());
+  }
+}
+
 void pollFirebaseControls() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+
   unsigned long now = millis();
   if (now - lastFirebaseControlMs < 2000) return;  // Poll every 2 seconds
   lastFirebaseControlMs = now;
 
-  // --- Air Pump Control ---
-  FirebaseData ctrlFbdo;
-  if (Firebase.getString(ctrlFbdo, "/controls/pump")) {
-    String cmd = ctrlFbdo.stringData();
-    cmd.toLowerCase(); cmd.trim();
-    if (cmd != lastPumpCommand && cmd.length() > 0) {
-      lastPumpCommand = cmd;
-      if (cmd == "on") {
-        setPump(true);
-        pumpManualOverride = true;
-        pumpManualOverrideTimeout = millis() + MANUAL_OVERRIDE_TIMEOUT_MS;
-        Serial.println("[Firebase] Remote command: Air Pump ON");
-      } else if (cmd == "off") {
-        setPump(false);
-        pumpManualOverride = true;
-        pumpManualOverrideTimeout = millis() + MANUAL_OVERRIDE_TIMEOUT_MS;
-        Serial.println("[Firebase] Remote command: Air Pump OFF");
-      }
+  if (!controlsArmed) {
+    armControls();
+    return;
+  }
+
+  String state;
+  double ts = 0;
+
+  // --- Air / dosing pump ---
+  if (readCommand("/controls/pump", state, ts) && ts > lastAppliedPumpTs) {
+    lastAppliedPumpTs = ts;
+    if (state == "on" || state == "off") {
+      setPump(state == "on");
+      pumpManualOverride = true;
+      pumpManualOverrideTimeout = millis() + MANUAL_OVERRIDE_TIMEOUT_MS;
+      Serial.printf("[Firebase] Remote command: Air Pump %s\n", state.c_str());
+    } else {
+      Serial.printf("[Firebase] Ignoring invalid pump command: '%s'\n", state.c_str());
     }
   }
 
-  // --- Auto Pump Control ---
-  if (Firebase.getString(ctrlFbdo, "/controls/autoPump")) {
-    String cmd = ctrlFbdo.stringData();
-    cmd.toLowerCase(); cmd.trim();
-    if (cmd != lastAutoPumpCommand && cmd.length() > 0) {
-      lastAutoPumpCommand = cmd;
-      if (cmd == "enable") {
-        setAutoPump(true);
-        pumpManualOverride = false;
-        Serial.println("[Firebase] Remote command: Auto Pump ENABLED");
-      } else if (cmd == "disable") {
-        setAutoPump(false);
-        pumpManualOverride = false;
-        Serial.println("[Firebase] Remote command: Auto Pump DISABLED");
-      }
+  // --- Auto pump mode ---
+  if (readCommand("/controls/autoPump", state, ts) && ts > lastAppliedAutoPumpTs) {
+    lastAppliedAutoPumpTs = ts;
+    String norm = normalizeAction(state);
+    if (norm.length() > 0) {
+      setAutoPump(norm == "enable");
+      pumpManualOverride = false;
+      Serial.printf("[Firebase] Remote command: Auto Pump %s\n", norm.c_str());
+    } else {
+      Serial.printf("[Firebase] Ignoring invalid autoPump command: '%s'\n", state.c_str());
     }
   }
 
-  // --- Water Pump Control ---
-  if (Firebase.getString(ctrlFbdo, "/controls/waterPump")) {
-    String cmd = ctrlFbdo.stringData();
-    cmd.toLowerCase(); cmd.trim();
-    if (cmd != lastWaterPumpCommand && cmd.length() > 0) {
-      lastWaterPumpCommand = cmd;
-      if (cmd == "on") {
-        setWaterPump(true);
-        Serial.println("[Firebase] Remote command: Water Pump ON");
-      } else if (cmd == "off") {
-        setWaterPump(false);
-        Serial.println("[Firebase] Remote command: Water Pump OFF");
-      }
+  // --- Water pump ---
+  if (readCommand("/controls/waterPump", state, ts) && ts > lastAppliedWaterPumpTs) {
+    lastAppliedWaterPumpTs = ts;
+    if (state == "on" || state == "off") {
+      setWaterPump(state == "on");
+      Serial.printf("[Firebase] Remote command: Water Pump %s\n", state.c_str());
+    } else {
+      Serial.printf("[Firebase] Ignoring invalid waterPump command: '%s'\n", state.c_str());
     }
   }
+
+  pollFirebaseGsm();
 }
 
 void setup() {
@@ -784,6 +1076,7 @@ void setup() {
   setupLCD();
   setupSPIFFS();
   setupWiFi();
+  setupTime();       // must precede Firebase: TLS validation and history rows need a real clock
   setupFirebase();
   setupWebServer();
 
@@ -798,6 +1091,18 @@ void loop() {
   if (pumpManualOverride && pumpManualOverrideTimeout > 0 && now >= pumpManualOverrideTimeout) {
     pumpManualOverride = false;
     Serial.println("Manual pump override timeout expired. Auto control resumed.");
+  }
+
+  // Water pump safety cap. Nothing else ever switches this pump off, so without
+  // this a remote "on" plus a dropped connection runs it indefinitely.
+  if (waterPumpActive && waterPumpOnSinceMs > 0 &&
+      now - waterPumpOnSinceMs >= WATER_PUMP_MAX_ON_MS) {
+    Serial.println("[SAFETY] Water pump hit max runtime. Forcing OFF.");
+    setWaterPump(false);
+    if (Firebase.ready()) {
+      writeCommand("/controls/waterPump", "off", epochMillis());
+      lastAppliedWaterPumpTs = epochMillis();
+    }
   }
   
   SensorData data = readAllSensors();
@@ -844,6 +1149,14 @@ void loop() {
     lastPrint = millis();
   }
   
+  // Heap trend. A steady decline here means something is leaking — this is how
+  // the per-poll FirebaseData allocation showed up before it was made global.
+  if (millis() - lastHeapLogMs >= 60000) {
+    lastHeapLogMs = millis();
+    Serial.printf("[HEAP] free=%u bytes, largest block=%u, uptime=%lus\n",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap(), millis() / 1000);
+  }
+
   // Update LCD display every 5 seconds
   updateLCDDisplay();
   

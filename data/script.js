@@ -66,12 +66,18 @@ const apexChartOptions = {
 };
 
 // ========== Firebase Setup ==========
+// The database rules are open, so there is no sign-in here and no API key is
+// needed — the Realtime Database SDK only requires databaseURL. This URL ships
+// in the public bundle, so treat it as the one thing standing between a
+// stranger and the pumps: anyone who has it can read the data and switch them.
 const firebaseConfig = {
     databaseURL: "https://hydrophonic-bucket-system-default-rtdb.asia-southeast1.firebasedatabase.app/"
 };
 
 let db = null;
 let firebaseInitialized = false;
+let listenersAttached = false;
+let freshnessTimer = null;
 
 if (typeof firebase !== 'undefined') {
     try {
@@ -84,23 +90,50 @@ if (typeof firebase !== 'undefined') {
     }
 }
 
+// ========== Firebase Startup ==========
+// Guarded by listenersAttached so it can be called more than once without
+// stacking duplicate handlers, which would double-count history rows.
+function startFirebase() {
+    if (!firebaseInitialized || !db) {
+        setConnection(false, 'Firebase SDK missing');
+        return;
+    }
+    if (!listenersAttached) {
+        setupFirebaseListeners();
+        // Re-check staleness on a timer too: if the ESP32 dies, no new snapshot
+        // arrives, so nothing else would ever notice it went quiet.
+        if (!freshnessTimer) freshnessTimer = setInterval(checkLiveFreshness, 10000);
+        listenersAttached = true;
+    }
+    fetchGsmSettingsFromFirebase();
+}
+
 // ========== Init ==========
 document.addEventListener('DOMContentLoaded', () => {
     initializeCharts();
-    setupFirebaseListeners();
     setText('csvStatus', DATA_SOURCE_LABEL);
 
     if (!IS_NETLIFY) {
-        // Local mode: poll ESP32 directly via HTTP API
+        // LAN mode: talk to the ESP32 directly, so the dashboard keeps working
+        // if the internet (or Firebase) is unavailable.
+        //
+        // Deliberately no Firebase listeners here. Local polling appends to
+        // sensorHistory every 5s while the Firebase history listener replaces
+        // that whole array on every push, so running both makes the charts
+        // fight each other. Control presses still write to Firebase below, so
+        // the cloud view stays in sync either way.
         fetchLiveData();
         checkStatus();
         fetchGsmSettings();
         liveDataInterval = setInterval(fetchLiveData, 5000);
         setInterval(checkStatus, 15000);
-    } else {
-        // Netlify mode: GSM settings from Firebase
-        fetchGsmSettingsFromFirebase();
+        return;
     }
+
+    // Cloud mode: everything goes through Firebase. No sign-in step — the rules
+    // are open, so data flows as soon as the SDK connects.
+    setConnection(false, 'Connecting...');
+    startFirebase();
 });
 
 // ========== Firebase Listeners ==========
@@ -114,7 +147,10 @@ function setupFirebaseListeners() {
     db.ref('sensors/live').on('value', (snapshot) => {
         const data = snapshot.val();
         if (data) {
-            setConnection(true, IS_NETLIFY ? 'Firebase Live' : 'Connected');
+            // In LAN mode Firebase is a bonus channel, so mark connected here.
+            // In cloud mode updateLiveDisplay -> checkLiveFreshness decides,
+            // since a cached snapshot alone doesn't mean the device is alive.
+            if (!IS_NETLIFY) setConnection(true, 'Connected');
             updateLiveDisplay(data);
         } else {
             // Firebase is connected, but waiting for ESP32 data push
@@ -144,16 +180,36 @@ function setupFirebaseListeners() {
 }
 
 // ========== Control Helpers ==========
-async function firebaseControl(path, value) {
+// Raw write — used for plain settings objects like /gsm.
+async function firebaseSet(path, value) {
     if (!firebaseInitialized || !db) return;
     return db.ref(path).set(value);
+}
+
+// Command write — used for /controls/*. The firmware matches on `ts`, not on the
+// string, so pressing the same button twice still registers, and a command left
+// in the database can't silently re-fire a pump after the ESP32 reboots (on boot
+// the device stamps its own "off" and ignores anything older).
+//
+// ts comes from Firebase's SERVER clock, never the browser's. The firmware only
+// applies a command when ts > the last one it applied, so a phone with a slow
+// clock would have every press silently ignored, and a phone running fast would
+// push that watermark into the future and deaden the controls until real time
+// caught up. Server time keeps the device and every client on one timeline.
+// Rules still see a number: the placeholder resolves before .validate runs.
+// Shape is enforced by database.rules.json: {state: string<=16, ts: number}.
+async function firebaseCommand(path, state) {
+    return firebaseSet(path, {
+        state,
+        ts: firebase.database.ServerValue.TIMESTAMP
+    });
 }
 
 // ========== Control Buttons ==========
 async function controlPump(action) {
     // Send to Firebase
     try {
-        await firebaseControl('controls/pump', action);
+        await firebaseCommand('controls/pump', action);
         if (IS_NETLIFY) showToast(`Air Pump: ${action.toUpperCase()} sent to Firebase`);
     } catch (e) {
         console.warn("Firebase control set failed:", e);
@@ -178,7 +234,7 @@ async function controlPump(action) {
 
 async function controlPumpAuto(action) {
     try {
-        await firebaseControl('controls/autoPump', action);
+        await firebaseCommand('controls/autoPump', action);
         if (IS_NETLIFY) showToast(`Auto Pump: ${action.toUpperCase()} sent to Firebase`);
     } catch (e) {
         console.warn("Firebase auto pump set failed:", e);
@@ -204,7 +260,7 @@ async function controlPumpAuto(action) {
 
 async function controlWaterPump(action) {
     try {
-        await firebaseControl('controls/waterPump', action);
+        await firebaseCommand('controls/waterPump', action);
         if (IS_NETLIFY) showToast(`Water Pump: ${action.toUpperCase()} sent to Firebase`);
     } catch (e) {
         console.warn("Firebase water pump set failed:", e);
@@ -266,7 +322,7 @@ async function saveGsmSettings() {
     const enabled     = document.getElementById('gsmEnabled').checked;
 
     try {
-        await firebaseControl('gsm', { phoneNumber, message, enabled });
+        await firebaseSet('gsm', { phoneNumber, message, enabled });
     } catch (e) {}
 
     if (IS_NETLIFY) {
@@ -403,6 +459,39 @@ function setConnection(isConnected, customLabel = '') {
 }
 
 // ========== Display Update ==========
+// The ESP32 pushes /sensors/live every 5s. If we haven't heard from it in this
+// long, the device is offline even though Firebase itself is connected fine —
+// an important distinction when the whole point is remote monitoring.
+const LIVE_STALE_MS = 45000;
+let lastLiveTimestamp = 0;   // device's own NTP clock, for display
+let lastLiveArrivalMs = 0;   // when we received it, for staleness
+let liveUpdates = 0;         // how many snapshots we've seen this page load
+
+function checkLiveFreshness() {
+    if (!IS_NETLIFY || !lastLiveArrivalMs) return;
+
+    // Two signals, each covering the other's blind spot:
+    //  - arrival age is immune to a skewed phone clock, but the first snapshot
+    //    is a cached replay that "arrives" now even if the device died hours ago;
+    //  - device-timestamp age catches that stale replay, but trusts the browser
+    //    clock.
+    // So the device timestamp is only consulted until a genuinely fresh push
+    // lands; after that, arrival age alone is both sufficient and skew-proof.
+    const arrivalAge = Date.now() - lastLiveArrivalMs;
+    const deviceAge  = lastLiveTimestamp ? Date.now() - lastLiveTimestamp : 0;
+    const age = liveUpdates > 1 ? arrivalAge : Math.max(arrivalAge, deviceAge);
+
+    if (age > LIVE_STALE_MS) {
+        const mins = Math.floor(age / 60000);
+        const ago = mins >= 60 ? `${Math.floor(mins / 60)}h ago`
+                  : mins >= 1  ? `${mins}m ago`
+                               : `${Math.floor(age / 1000)}s ago`;
+        setConnection(false, `ESP32 offline — last seen ${ago}`);
+    } else {
+        setConnection(true, 'Firebase Live');
+    }
+}
+
 function updateLiveDisplay(data) {
     if (data.dhtTemperature !== undefined && data.dhtTemperature !== -1) {
         setHTML('liveTemp', `${Number(data.dhtTemperature).toFixed(2)}<span class="unit">°C</span>`);
@@ -420,10 +509,18 @@ function updateLiveDisplay(data) {
     setHTML('liveTDS',  `${Number(data.tdsMScm  || 0).toFixed(2)}<span class="unit">mS/cm</span>`);
     setText('liveWaterLevel', data.waterLevel || 'LOW');
 
-    const now = new Date();
-    const formattedDate = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}, ${now.toLocaleTimeString()}`;
+    // Prefer the device's own timestamp over the browser clock. Firebase replays
+    // the last cached value on connect, so without this a dead ESP32 would keep
+    // reporting "Live" with hours-old readings every time the page was opened.
+    const deviceTs = Number(data.timestamp) || 0;
+    lastLiveTimestamp = deviceTs;
+    lastLiveArrivalMs = Date.now();
+    liveUpdates++;
+    const stamp = deviceTs > 0 ? new Date(deviceTs) : new Date();
+    const formattedDate = `${String(stamp.getDate()).padStart(2,'0')}/${String(stamp.getMonth()+1).padStart(2,'0')}/${stamp.getFullYear()}, ${stamp.toLocaleTimeString()}`;
     setText('lastUpdate', formattedDate);
-    setText('debugCSVTime', now.toLocaleTimeString());
+    setText('debugCSVTime', stamp.toLocaleTimeString());
+    checkLiveFreshness();
 
     const isAirPumpOn   = !!data.pumpActive;
     const isWaterPumpOn = !!data.waterPumpActive;
@@ -540,16 +637,31 @@ function updateSeries(chartKey, name, timestamps, values) {
 }
 
 // ========== CSV Download Export ==========
+// Hard cap on an export pull. The history node grows ~1440 rows/day forever, so
+// an unbounded once('value') would eventually download tens of MB — painful on
+// mobile data, which is the main way this dashboard gets used.
+const CSV_MAX_ROWS = 5000;
+
 function downloadCSV() {
     if (!sensorHistory.length) {
         if (IS_NETLIFY && firebaseInitialized && db) {
             showToast('Fetching history from Firebase...');
-            db.ref('sensors/history').once('value', (snapshot) => {
-                const historyObj = snapshot.val();
-                if (!historyObj) { alert('No history data in Firebase yet.'); return; }
-                const allHistory = Object.values(historyObj).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-                exportCSV(allHistory);
-            });
+            db.ref('sensors/history')
+              .orderByChild('timestamp')
+              .limitToLast(CSV_MAX_ROWS)
+              .once('value')
+              .then((snapshot) => {
+                  const historyObj = snapshot.val();
+                  if (!historyObj) { alert('No history data in Firebase yet.'); return; }
+                  const allHistory = Object.values(historyObj)
+                      .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+                  exportCSV(allHistory);
+                  showToast(`Exported ${allHistory.length} rows`);
+              })
+              .catch((e) => {
+                  console.error('History export failed:', e);
+                  alert(`Could not fetch history: ${e.message}`);
+              });
         } else {
             alert('No historical sensor data available to export.');
         }
@@ -558,19 +670,29 @@ function downloadCSV() {
     exportCSV(sensorHistory);
 }
 
+// Quote anything containing a comma, quote or newline, and neutralise values a
+// spreadsheet would treat as a formula.
+function csvCell(value) {
+    let s = (value === undefined || value === null) ? '' : String(value);
+    if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+    if (/[",\n\r]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+    return s;
+}
+
 function exportCSV(rows) {
     const headers = ['Timestamp', 'Air Temp (C)', 'Humidity (%)', 'Water Temp (C)', 'Water Level', 'EC (mS/cm)', 'Flow Rate (L/min)'];
     const csvRows = rows.map(row => [
         row.timestamp ? new Date(row.timestamp).toISOString() : '',
-        row.dhtTemperature  ?? '',
-        row.dhtHumidity     ?? '',
+        row.dhtTemperature   ?? '',
+        row.dhtHumidity      ?? '',
         row.waterTemperature ?? '',
         row.waterLevel       ?? '',
         row.tdsMScm          ?? '',
         row.flowRate         ?? ''
-    ]);
+    ].map(csvCell));
 
-    const csvContent = [headers.join(','), ...csvRows.map(e => e.join(','))].join('\n');
+    // Leading BOM so Excel opens it as UTF-8 rather than mangling characters.
+    const csvContent = '﻿' + [headers.map(csvCell).join(','), ...csvRows.map(e => e.join(','))].join('\r\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url  = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -579,6 +701,7 @@ function exportCSV(rows) {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);   // otherwise the blob is held until page unload
 }
 
 window.addEventListener('beforeunload', () => {

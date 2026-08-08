@@ -1,0 +1,35 @@
+# Normalize line endings.
+#
+# Windows/OneDrive tooling rewrote several files as CRLF while git has them
+# stored as LF, which made ~2300 lines show up as "modified" in files nobody
+# had actually edited and buried the real changes. Storing LF in the repo and
+# letting git handle checkout keeps diffs reviewable.
+* text=auto eol=lf
+
+# Firmware / web sources — always LF.
+*.cpp    text eol=lf
+*.h      text eol=lf
+*.ino    text eol=lf
+*.c      text eol=lf
+*.js     text eol=lf
+*.css    text eol=lf
+*.html   text eol=lf
+*.json   text eol=lf
+*.md     text eol=lf
+*.ini    text eol=lf
+*.toml   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+
+# Windows-native files keep CRLF so they open correctly in Windows editors.
+*.bat    text eol=crlf
+*.ps1    text eol=crlf
+
+# Binary — never touch, never diff as text.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.bin    binary
+*.pdf    binary
