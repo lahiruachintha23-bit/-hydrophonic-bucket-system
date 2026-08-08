@@ -691,6 +691,12 @@ void setupWiFi() {
     Serial.println("\nWiFi connected");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+    // Disable WiFi modem sleep. With it on (the default), the radio naps between
+    // beacons and the BearSSL handshake to Firebase intermittently fails to send
+    // its ClientHello — surfacing as "Error writing to basic client" and
+    // "Failed to initialize the SSL layer". Keeping the radio awake costs a
+    // little power but makes the TLS connection reliable.
+    WiFi.setSleep(false);
   } else {
     Serial.println("\nWiFi failed. Starting Access Point mode.");
     WiFi.mode(WIFI_AP);
@@ -754,6 +760,13 @@ void setupFirebase() {
   Firebase.reconnectNetwork(true);
   Firebase.begin(&fbConfig, &fbAuth);
 
+  // Heap snapshot at the moment of the first HTTPS connection. BearSSL needs a
+  // large contiguous block (~40KB) for the TLS handshake; if the largest free
+  // block is smaller than that, the SSL layer fails to initialize. If this
+  // prints a low maxAlloc, the async web server is fragmenting the heap and the
+  // fix is to start Firebase before beginning the web server.
+  Serial.printf("[Firebase] Heap at connect: free=%u, maxAlloc=%u\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   Serial.println("[Firebase] Connecting (open rules, no sign-in)");
 }
 

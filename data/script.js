@@ -66,12 +66,20 @@ const apexChartOptions = {
 };
 
 // ========== Firebase Setup ==========
-// The database rules are open, so there is no sign-in here and no API key is
-// needed — the Realtime Database SDK only requires databaseURL. This URL ships
-// in the public bundle, so treat it as the one thing standing between a
-// stranger and the pumps: anyone who has it can read the data and switch them.
+// Full web config from the Firebase console. With open database rules there is
+// no sign-in, and the Realtime Database SDK only actually needs databaseURL —
+// the rest is kept as-is so the config matches the console and other Firebase
+// features would work if ever added. None of these are secrets; they ship in
+// the public bundle by design.
 const firebaseConfig = {
-    databaseURL: "https://hydrophonic-bucket-system-default-rtdb.asia-southeast1.firebasedatabase.app/"
+    apiKey: "AIzaSyDjj5KLWLrV0kM7gP6eiRLNcxqssXuVThA",
+    authDomain: "hydrophonic-bucket-system.firebaseapp.com",
+    databaseURL: "https://hydrophonic-bucket-system-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "hydrophonic-bucket-system",
+    storageBucket: "hydrophonic-bucket-system.firebasestorage.app",
+    messagingSenderId: "1006449836910",
+    appId: "1:1006449836910:web:e5c5960a383056b9f3b77f",
+    measurementId: "G-2MJMHYG6KB"
 };
 
 let db = null;
