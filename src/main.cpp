@@ -13,7 +13,12 @@
 #include <FirebaseESP32.h>
 #include <addons/TokenHelper.h>
 #include <time.h>
-#include "secrets.h"
+
+// ==================== Connection constants ====================
+const char* WIFI_SSID = "Infinix NOTE 40";
+const char* WIFI_PASSWORD = "Achi@234";
+const char* FIREBASE_DB_URL = "https://hydrophonic-bucket-system-default-rtdb.asia-southeast1.firebasedatabase.app/";
+const char* GSM_PHONE_NUMBER = "+94740879724";
 
 // ==================== Firebase ====================
 FirebaseData fbdo;      // sensor writes
