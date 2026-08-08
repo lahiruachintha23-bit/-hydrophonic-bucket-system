@@ -85,6 +85,10 @@ bool timeSynced = false;
 // ==================== EC Auto Pump Control ====================
 const float EC_LOWER = 2.2f;         // Pump turns ON when EC drops below this
 const float EC_UPPER = 2.8f;         // Pump turns OFF when EC reaches this
+// A disconnected or dry TDS probe reads ~0 mS/cm, which is below EC_LOWER and
+// would make auto mode dose nutrient forever into a tank it cannot actually
+// measure. Treat any reading at or below this as a failed sensor, not a low tank.
+const float EC_SENSOR_MIN_VALID = 0.05f;
 const unsigned long MIN_PUMP_ON_MS = 10000;  // Minimum pump run time (10s)
 const unsigned long MIN_PUMP_OFF_MS = 10000; // Minimum pump off time (10s)
 const unsigned long MANUAL_OVERRIDE_TIMEOUT_MS = 300000; // Manual override timeout (5 min)
@@ -1130,23 +1134,35 @@ void loop() {
 
   // Auto pump control logic (only if auto mode enabled and no manual override)
   if (autoPumpEnabled && !pumpManualOverride) {
-    // Turn pump ON if EC drops below lower threshold
-    if (data.tdsMScm < EC_LOWER && !pumpActive) {
-      if (lastPumpOffTime == 0 || (now - lastPumpOffTime >= MIN_PUMP_OFF_MS)) {
-        Serial.printf("EC (%.2f mS/cm) below lower threshold (%.2f). Turning pump ON.\n", 
-                      data.tdsMScm, EC_LOWER);
-        setPump(true);
-        pumpWasTurnedOn = true;
-      }
-    }
-
-    // Turn pump OFF if EC reaches or exceeds upper threshold
-    if (data.tdsMScm >= EC_UPPER && pumpActive && pumpWasTurnedOn) {
-      if (now - lastPumpOnTime >= MIN_PUMP_ON_MS) {
-        Serial.printf("EC (%.2f mS/cm) reached upper threshold (%.2f). Turning pump OFF.\n", 
-                      data.tdsMScm, EC_UPPER);
+    // Sensor sanity guard: a dead or disconnected TDS probe reads ~0.00, which
+    // would otherwise look like an empty tank and dose nutrient forever. When the
+    // reading is implausible, force the pump off (once) and skip dosing entirely;
+    // the rest of loop() still runs so the LCD and logs keep updating.
+    if (data.tdsMScm <= EC_SENSOR_MIN_VALID) {
+      if (pumpActive) {
+        Serial.printf("[SAFETY] EC reading %.2f mS/cm is implausible (probe disconnected?). Forcing pump OFF.\n", data.tdsMScm);
         setPump(false);
         pumpWasTurnedOn = false;
+      }
+    } else {
+      // Turn pump ON if EC drops below lower threshold
+      if (data.tdsMScm < EC_LOWER && !pumpActive) {
+        if (lastPumpOffTime == 0 || (now - lastPumpOffTime >= MIN_PUMP_OFF_MS)) {
+          Serial.printf("EC (%.2f mS/cm) below lower threshold (%.2f). Turning pump ON.\n",
+                        data.tdsMScm, EC_LOWER);
+          setPump(true);
+          pumpWasTurnedOn = true;
+        }
+      }
+
+      // Turn pump OFF if EC reaches or exceeds upper threshold
+      if (data.tdsMScm >= EC_UPPER && pumpActive && pumpWasTurnedOn) {
+        if (now - lastPumpOnTime >= MIN_PUMP_ON_MS) {
+          Serial.printf("EC (%.2f mS/cm) reached upper threshold (%.2f). Turning pump OFF.\n",
+                        data.tdsMScm, EC_UPPER);
+          setPump(false);
+          pumpWasTurnedOn = false;
+        }
       }
     }
   }
