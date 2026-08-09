@@ -119,7 +119,7 @@ DHT dht(DHT_PIN, DHT22);
 OneWire oneWire(ONEWIRE_PIN);
 DallasTemperature tempSensor(&oneWire);
 AsyncWebServer server(80);
-LiquidCrystal_I2C lcd(0x27, 16, 2);  // I2C address 0x27, 16 columns, 2 rows
+LiquidCrystal_I2C lcd(0x27, 16, 4);  // I2C address 0x27, 16 columns, 4 rows
 bool lcdAvailable = false;
 HardwareSerial sim900(2);
 
@@ -501,10 +501,15 @@ void setupLCD() {
   Wire.begin(I2C_SDA, I2C_SCL);
   lcd.init();
   lcd.backlight();
+  lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Hydroponic");
+  lcd.print("Hydroponic System");
   lcd.setCursor(0, 1);
-  lcd.print("Dashboard");
+  lcd.print("Initializing...");
+  lcd.setCursor(0, 2);
+  lcd.print("Please wait...");
+  lcd.setCursor(0, 3);
+  lcd.print(" ");
   lcdAvailable = true;
   Serial.println("LCD initialized successfully");
 }
@@ -518,18 +523,35 @@ void updateLCDDisplay() {
   
   SensorData data = latestData;
 
-  // Row 1: Pump status + Auto status
-  char row1[17] = {0};
-  snprintf(row1, 17, "P:%s A:%s", pumpActive ? "ON " : "OFF", autoPumpEnabled ? "ON" : "OF");
-  
-  // Row 2: EC level (mS/cm)
-  char row2[17] = {0};
-  snprintf(row2, 17, "EC:%.2fmS/cm", data.tdsMScm);
-  
+  char row1[17] = "                ";
+  char row2[17] = "                ";
+  char row3[17] = "                ";
+  char row4[17] = "                ";
+
+  snprintf(row1, sizeof(row1), "P:%s A:%s", pumpActive ? "ON " : "OFF", autoPumpEnabled ? "ON" : "OF");
+  snprintf(row2, sizeof(row2), "EC:%4.2fmS  W:%2.0f", data.tdsMScm, data.waterTemp);
+  snprintf(row3, sizeof(row3), "F:%4.1fL/m  L:%s", data.flowRateMlMin / 1000.0f, data.waterLevelHigh ? "HIGH" : "LOW");
+  snprintf(row4, sizeof(row4), "GSM:%s  OV:%s", gsmEnabled ? "ON" : "OFF", pumpManualOverride ? "YES" : "NO");
+
+  lcd.setCursor(0, 0);
+  lcd.print("                ");
   lcd.setCursor(0, 0);
   lcd.print(row1);
+
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
   lcd.setCursor(0, 1);
   lcd.print(row2);
+
+  lcd.setCursor(0, 2);
+  lcd.print("                ");
+  lcd.setCursor(0, 2);
+  lcd.print(row3);
+
+  lcd.setCursor(0, 3);
+  lcd.print("                ");
+  lcd.setCursor(0, 3);
+  lcd.print(row4);
 }
 
 bool getActionParam(AsyncWebServerRequest *request, String &action) {
@@ -709,6 +731,33 @@ void setupWebServer() {
     String response;
     serializeJson(doc, response);
     sendJson(request, 200, response);
+  });
+
+  server.on("/api/gsm/send", HTTP_POST, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    if (gsmPhoneNumber.length() < 5 || gsmAlertMessage.length() == 0) {
+      doc["status"] = "error";
+      doc["message"] = "GSM phone number or message not configured";
+      String response;
+      serializeJson(doc, response);
+      sendJson(request, 400, response);
+      return;
+    }
+
+    bool sent = sendGsmSms(gsmPhoneNumber, gsmAlertMessage);
+    if (sent) {
+      doc["status"] = "ok";
+      doc["message"] = "SMS sent";
+    } else {
+      doc["status"] = "error";
+      doc["message"] = "SMS send failed";
+    }
+    doc["enabled"] = gsmEnabled;
+    doc["phoneNumber"] = gsmPhoneNumber;
+    doc["messageText"] = gsmAlertMessage;
+    String response;
+    serializeJson(doc, response);
+    sendJson(request, sent ? 200 : 500, response);
   });
 
   server.on("/api/testrelay", HTTP_GET, [](AsyncWebServerRequest *request) {

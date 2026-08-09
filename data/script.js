@@ -449,6 +449,31 @@ async function fetchGsmSettings() {
     }
 }
 
+async function sendManualGsmMessage() {
+    const button = document.querySelector('button[onclick="sendManualGsmMessage()"]');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '⏳ Sending...';
+    }
+
+    try {
+        const data = await apiPostForm('/api/gsm/send', {});
+        if (data.status === 'ok') {
+            showToast('SMS sent successfully');
+        } else {
+            showToast(data.message || 'SMS send failed');
+        }
+    } catch (error) {
+        console.error('Manual SMS send failed:', error);
+        showToast(`Send failed: ${error.message}`);
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '📤 Send Now';
+        }
+    }
+}
+
 // ========== Connection State UI ==========
 function setConnection(isConnected, customLabel = '') {
     const liveDot = document.getElementById('liveDot');
