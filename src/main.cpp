@@ -807,7 +807,7 @@ void updateLCDDisplay() {
   char row3[17] = "                ";
   char row4[17] = "                ";
 
-  snprintf(row1, sizeof(row1), "PUMP:%s  AUTO:%s", pumpActive ? "ON" : "OFF", autoPumpEnabled ? "ON" : "OFF");
+  snprintf(row1, sizeof(row1), "DOSE:%s AUTO:%s", pumpActive ? "ON" : "OFF", autoPumpEnabled ? "ON" : "OFF");
   snprintf(row2, sizeof(row2), "EC:%4.2f W:%4.1fC", data.tdsMScm, data.waterTemp);
   snprintf(row3, sizeof(row3), "F:%4.1fLPM L:%s", data.flowRateMlMin / 1000.0f, data.waterLevelHigh ? "HIGH" : "LOW");
   snprintf(row4, sizeof(row4), "GSM:%s OV:%s", gsmEnabled ? "ON" : "OFF", pumpManualOverride ? "YES" : "NO");

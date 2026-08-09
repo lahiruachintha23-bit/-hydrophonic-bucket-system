@@ -67,24 +67,14 @@
                 <span class="sensor-desc">Float Switch</span>
             </div>
 
-            <!-- Air Pump -->
+            <!-- Dosing Pump (peristaltic) -->
             <div class="card sensor-card">
-                <span class="sensor-label">Air Pump</span>
+                <span class="sensor-label">Dosing Pump</span>
                 <div class="pump-card-inner">
-                    <span class="pump-status-text" id="airPumpStatus">Idle</span>
-                    <span class="pump-badge" id="airPumpBadge">OFF</span>
+                    <span class="pump-status-text" id="dosingPumpStatus">Idle</span>
+                    <span class="pump-badge" id="dosingPumpBadge">OFF</span>
                 </div>
                 <span class="sensor-desc" id="autoPumpStateDesc">Auto: <span id="autoPumpState">--</span></span>
-            </div>
-
-            <!-- Water Pump -->
-            <div class="card sensor-card">
-                <span class="sensor-label">Water Pump</span>
-                <div class="pump-card-inner">
-                    <span class="pump-status-text" id="waterPumpStatus">Idle</span>
-                    <span class="pump-badge" id="waterPumpBadge">OFF</span>
-                </div>
-                <span class="sensor-desc">Water Pump Control</span>
             </div>
 
             <!-- Reports -->
@@ -145,9 +135,9 @@
         <!-- ===== SYSTEM CONTROLS ===== -->
         <div class="section-heading">System Controls</div>
         <div class="controls-grid">
-            <!-- Auto Pump -->
+            <!-- Automatic Dosing -->
             <div class="card control-card">
-                <div class="control-title">Automatic Pump Control</div>
+                <div class="control-title">Automatic Dosing Control</div>
                 <div class="control-buttons">
                     <button class="btn btn-success" onclick="controlPumpAuto('enable')">✅ Auto ON (2.2–2.8 mS/cm)</button>
                     <button class="btn btn-danger"  onclick="controlPumpAuto('disable')">❌ Auto OFF</button>
@@ -156,25 +146,15 @@
                 <p class="control-status">EC Thresholds: <span id="ecThresholds">--</span></p>
             </div>
 
-            <!-- Manual Pump -->
+            <!-- Manual Dosing Pump -->
             <div class="card control-card">
-                <div class="control-title">Manual Pump Override</div>
+                <div class="control-title">Manual Dosing Pump Control</div>
                 <div class="control-buttons">
-                    <button class="btn btn-success" onclick="controlPump('on')">🟢 Pump ON</button>
-                    <button class="btn btn-danger"  onclick="controlPump('off')">🔴 Pump OFF</button>
+                    <button class="btn btn-success" onclick="controlPump('on')">🟢 Dosing Pump ON</button>
+                    <button class="btn btn-danger"  onclick="controlPump('off')">🔴 Dosing Pump OFF</button>
                 </div>
-                <p class="control-status">Pump: <span id="pumpState">--</span></p>
+                <p class="control-status">Dosing Pump: <span id="pumpState">--</span></p>
                 <p class="control-status">Manual Override: <span id="manualOverrideStatus">Inactive</span></p>
-            </div>
-
-            <!-- Water Pump -->
-            <div class="card control-card">
-                <div class="control-title">Water Pump Control</div>
-                <div class="control-buttons">
-                    <button class="btn btn-success" onclick="controlWaterPump('on')">🟢 Water Pump ON</button>
-                    <button class="btn btn-danger"  onclick="controlWaterPump('off')">🔴 Water Pump OFF</button>
-                </div>
-                <p class="control-status">Water Pump: <span id="waterPumpState">--</span></p>
             </div>
         </div>
 

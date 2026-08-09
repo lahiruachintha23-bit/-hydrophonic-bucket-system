@@ -214,11 +214,15 @@ async function firebaseCommand(path, state) {
 }
 
 // ========== Control Buttons ==========
+// Controls the peristaltic dosing pump (relay on PUMP_PIN). The Firebase node
+// stays "controls/pump" — renaming it would break compatibility with firmware
+// that's already deployed and with any stored command; only the UI wording
+// changed to "Dosing Pump".
 async function controlPump(action) {
     // Send to Firebase
     try {
         await firebaseCommand('controls/pump', action);
-        if (IS_NETLIFY) showToast(`Air Pump: ${action.toUpperCase()} sent to Firebase`);
+        if (IS_NETLIFY) showToast(`Dosing Pump: ${action.toUpperCase()} sent to Firebase`);
     } catch (e) {
         console.warn("Firebase control set failed:", e);
         // In cloud mode this write IS the only way the command reaches the
@@ -239,8 +243,8 @@ async function controlPump(action) {
             );
             await fetchLiveData();
         } catch (error) {
-            console.error('Local pump control error:', error);
-            alert(`Failed to control pump locally: ${error.message}`);
+            console.error('Local dosing pump control error:', error);
+            alert(`Failed to control dosing pump locally: ${error.message}`);
         }
     }
 }
@@ -260,36 +264,12 @@ async function controlPumpAuto(action) {
             updateControlStates(
                 data.pump === 'on',
                 data.autoPump === 'enabled',
-                data.pumpManualOverride === 'active',
-                0, 0,
-                data.waterPumpActive === 'on'
+                data.pumpManualOverride === 'active'
             );
             await fetchLiveData();
         } catch (error) {
-            console.error('Local auto pump control error:', error);
-            alert(`Failed to control auto pump locally: ${error.message}`);
-        }
-    }
-}
-
-async function controlWaterPump(action) {
-    try {
-        await firebaseCommand('controls/waterPump', action);
-        if (IS_NETLIFY) showToast(`Water Pump: ${action.toUpperCase()} sent to Firebase`);
-    } catch (e) {
-        console.warn("Firebase water pump set failed:", e);
-        if (IS_NETLIFY) showToast(`Failed to send command: ${e.message || e}`);
-    }
-
-    if (!IS_NETLIFY) {
-        try {
-            const data = await apiPost('/api/waterpump', action);
-            const waterPumpOn = data.waterPump === 'on';
-            updateControlStates(false, false, false, 0, 0, waterPumpOn);
-            await fetchLiveData();
-        } catch (error) {
-            console.error('Local water pump control error:', error);
-            alert(`Failed to control water pump locally: ${error.message}`);
+            console.error('Local auto dosing control error:', error);
+            alert(`Failed to control auto dosing locally: ${error.message}`);
         }
     }
 }
@@ -378,9 +358,7 @@ async function checkStatus() {
         updateControlStates(
             data.pump === 'on',
             data.autoPump === 'enabled',
-            data.pumpManualOverride === 'active',
-            0, 0,
-            data.waterPumpActive === 'on'
+            data.pumpManualOverride === 'active'
         );
     } catch (error) {
         console.error('Status check error:', error);
@@ -630,20 +608,16 @@ function updateLiveDisplay(data) {
     setText('debugCSVTime', stamp.toLocaleTimeString());
     checkLiveFreshness();
 
-    const isAirPumpOn   = !!data.pumpActive;
-    const isWaterPumpOn = !!data.waterPumpActive;
-    setText('airPumpStatus',   isAirPumpOn   ? 'Active' : 'Idle');
-    setText('waterPumpStatus', isWaterPumpOn ? 'Active' : 'Idle');
-    updateBadge('airPumpBadge',   isAirPumpOn);
-    updateBadge('waterPumpBadge', isWaterPumpOn);
+    const isDosingPumpOn = !!data.pumpActive;
+    setText('dosingPumpStatus', isDosingPumpOn ? 'Active' : 'Idle');
+    updateBadge('dosingPumpBadge', isDosingPumpOn);
 
     updateControlStates(
         data.pumpActive,
         data.autoPumpEnabled,
         data.pumpManualOverride,
         data.ecLower,
-        data.ecUpper,
-        data.waterPumpActive
+        data.ecUpper
     );
 }
 
@@ -655,12 +629,11 @@ function updateBadge(badgeId, isOn) {
     else el.classList.remove('on');
 }
 
-function updateControlStates(pumpActive, autoPumpEnabled, pumpManualOverride, ecLower, ecUpper, waterPumpActive = false) {
+function updateControlStates(pumpActive, autoPumpEnabled, pumpManualOverride, ecLower, ecUpper) {
     setText('pumpState',          pumpActive      ? 'ON ✓' : 'OFF ✗');
     setText('autoPumpState',      autoPumpEnabled  ? 'ENABLED'   : 'DISABLED');
     setText('autoPumpStateBadge', autoPumpEnabled  ? 'ENABLED ✓' : 'DISABLED ✗');
     setText('manualOverrideStatus', pumpManualOverride ? 'ACTIVE ⚠️' : 'Inactive');
-    setText('waterPumpState',     waterPumpActive  ? 'ON ✓' : 'OFF ✗');
 
     const ecThresholds = document.getElementById('ecThresholds');
     if (ecThresholds) {
