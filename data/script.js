@@ -221,6 +221,11 @@ async function controlPump(action) {
         if (IS_NETLIFY) showToast(`Air Pump: ${action.toUpperCase()} sent to Firebase`);
     } catch (e) {
         console.warn("Firebase control set failed:", e);
+        // In cloud mode this write IS the only way the command reaches the
+        // device — there's no local fallback below. Silently swallowing the
+        // error here (as before) made a permission-denied or offline Firebase
+        // write look identical to "nothing happened", with no clue why.
+        if (IS_NETLIFY) showToast(`Failed to send command: ${e.message || e}`);
     }
 
     // Send directly to local ESP32 if not on Netlify
@@ -246,6 +251,7 @@ async function controlPumpAuto(action) {
         if (IS_NETLIFY) showToast(`Auto Pump: ${action.toUpperCase()} sent to Firebase`);
     } catch (e) {
         console.warn("Firebase auto pump set failed:", e);
+        if (IS_NETLIFY) showToast(`Failed to send command: ${e.message || e}`);
     }
 
     if (!IS_NETLIFY) {
@@ -272,6 +278,7 @@ async function controlWaterPump(action) {
         if (IS_NETLIFY) showToast(`Water Pump: ${action.toUpperCase()} sent to Firebase`);
     } catch (e) {
         console.warn("Firebase water pump set failed:", e);
+        if (IS_NETLIFY) showToast(`Failed to send command: ${e.message || e}`);
     }
 
     if (!IS_NETLIFY) {
@@ -457,11 +464,20 @@ async function sendManualGsmMessage() {
     }
 
     try {
-        const data = await apiPostForm('/api/gsm/send', {});
-        if (data.status === 'ok') {
-            showToast('SMS sent successfully');
+        if (IS_NETLIFY) {
+            // The cloud dashboard has no server of its own to POST /api/gsm/send
+            // to — that endpoint only exists on the ESP32 itself, which this
+            // page isn't talking to directly. Route through Firebase instead,
+            // the same way the pump buttons do, and wait briefly for the device
+            // to write back a real result.
+            await sendGsmCommandViaFirebase();
         } else {
-            showToast(data.message || 'SMS send failed');
+            const data = await apiPostForm('/api/gsm/send', {});
+            if (data.status === 'ok') {
+                showToast('SMS sent successfully');
+            } else {
+                showToast(data.message || 'SMS send failed');
+            }
         }
     } catch (error) {
         console.error('Manual SMS send failed:', error);
@@ -472,6 +488,49 @@ async function sendManualGsmMessage() {
             button.textContent = '📤 Send Now';
         }
     }
+}
+
+// Writes the send command to Firebase, then listens on /device/gsmLastSendResult
+// for the ESP32 to report what actually happened (it writes {status, message, ts}
+// after attempting the send). Falls back to a generic "command sent" toast if the
+// device doesn't answer within the timeout — it may be offline, or on an older
+// firmware build that doesn't handle /controls/gsmSend yet.
+function sendGsmCommandViaFirebase() {
+    return new Promise((resolve, reject) => {
+        if (!firebaseInitialized || !db) {
+            reject(new Error('Firebase not available'));
+            return;
+        }
+
+        const requestedAt = Date.now();
+        firebaseCommand('controls/gsmSend', 'send')
+            .then(() => showToast('Send command sent to device…'))
+            .catch((e) => console.warn('Firebase gsmSend write failed:', e));
+
+        const ref = db.ref('device/gsmLastSendResult');
+        let settled = false;
+        const finish = (message) => {
+            if (settled) return;
+            settled = true;
+            ref.off('value', handler);
+            clearTimeout(timer);
+            showToast(message);
+            resolve();
+        };
+
+        const handler = ref.on('value', (snapshot) => {
+            const val = snapshot.val();
+            // Only trust a result timestamped after we sent the command — an
+            // older cached result would otherwise show a stale outcome.
+            if (val && val.ts && val.ts >= requestedAt - 5000) {
+                finish(val.status === 'ok' ? 'SMS sent successfully' : (val.message || 'SMS send failed'));
+            }
+        });
+
+        const timer = setTimeout(() => {
+            finish('Command sent — no response from device yet, check its status later');
+        }, 15000);
+    });
 }
 
 // ========== Connection State UI ==========

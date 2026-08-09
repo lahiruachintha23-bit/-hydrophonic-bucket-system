@@ -36,7 +36,7 @@
 
       "$control": {
         ".write": "newData.exists()",
-        ".validate": "($control === 'pump' || $control === 'autoPump' || $control === 'waterPump') && newData.hasChildren(['state', 'ts'])",
+        ".validate": "($control === 'pump' || $control === 'autoPump' || $control === 'waterPump' || $control === 'gsmSend') && newData.hasChildren(['state', 'ts'])",
         "state": {
           ".validate": "newData.isString() && newData.val().length <= 16"
         },

@@ -62,6 +62,7 @@ void pruneFirebaseHistory();   // defined below updateFirebase, called from it
 double lastAppliedPumpTs      = 0;
 double lastAppliedAutoPumpTs  = 0;
 double lastAppliedWaterPumpTs = 0;
+double lastAppliedGsmSendTs   = 0;  // manual "Send Now" button pressed from the cloud dashboard
 bool   controlsArmed          = false;  // true once boot-safe defaults are written
 
 // ==================== WiFi ====================
@@ -83,7 +84,7 @@ bool timeSynced = false;
 #define FLOW_SENSOR_PIN 18   // Water flow sensor
 #define FLOAT_SWITCH_PIN 19  // Float switch
 #define TDS_PIN 34           // TDS analog input
-#define PUMP_PIN 25          // Peristaltic pump relay
+#define PUMP_PIN 33          // Peristaltic pump relay
 #define WATER_PUMP_PIN 26    // Water pump relay
 #define GSM_RX_PIN 16        // GSM module RX pin (to module TX)
 #define GSM_TX_PIN 17        // GSM module TX pin (to module RX)
@@ -1261,6 +1262,10 @@ void armControls() {
   lastAppliedPumpTs = armTs;
   lastAppliedWaterPumpTs = armTs;
   lastAppliedAutoPumpTs = armTs;
+  // No relay to force off for this one, but the watermark still matters: without
+  // it, a "Send Now" press left over from a previous session (ts < armTs) would
+  // fire an SMS the instant the device reboots and reconnects.
+  lastAppliedGsmSendTs = armTs;
   controlsArmed = true;
   Serial.println("[Firebase] Controls armed: pumps forced OFF at boot");
 }
@@ -1356,6 +1361,26 @@ void pollFirebaseControls() {
     } else {
       Serial.printf("[Firebase] Ignoring invalid waterPump command: '%s'\n", state.c_str());
     }
+  }
+
+  // --- Manual "Send Now" SMS button (cloud dashboard) ---
+  // The cloud-hosted dashboard has no server of its own to hit /api/gsm/send on,
+  // so the button writes a command here instead, same as the pump buttons do.
+  if (readCommand("/controls/gsmSend", state, ts) && ts > lastAppliedGsmSendTs) {
+    lastAppliedGsmSendTs = ts;
+    Serial.println("[Firebase] Remote command: Manual GSM send");
+    bool sent = sendGsmSms(gsmPhoneNumber, gsmAlertMessage);
+
+    // Write the outcome back so the dashboard can show a real result instead of
+    // just "command sent". /device is unrestricted in database.rules.json, so
+    // this doesn't need a rules change the way /gsm or /controls would.
+    JsonDocument resultDoc;
+    resultDoc["status"]  = sent ? "ok" : "error";
+    resultDoc["message"] = sent ? "SMS sent" : "SMS send failed — check device Serial Monitor";
+    resultDoc["ts"]      = (long long)epochMillis();
+    String resultBody;
+    serializeJson(resultDoc, resultBody);
+    firebasePut("/device/gsmLastSendResult", resultBody);
   }
 
   pollFirebaseGsm();
