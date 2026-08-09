@@ -1,3 +1,9 @@
+// Build marker. If the Console doesn't print this line on page load, the
+// browser is running a CACHED older script.js and none of the current fixes are
+// active — which looks exactly like "the buttons do nothing".
+const DASHBOARD_BUILD = 'dosing-pump-v2';
+console.log(`[dashboard] script.js loaded — build ${DASHBOARD_BUILD}`);
+
 let liveDataInterval = null;
 let chartInstances = {};
 let sensorHistory = [];
@@ -219,6 +225,7 @@ async function firebaseCommand(path, state) {
 // that's already deployed and with any stored command; only the UI wording
 // changed to "Dosing Pump".
 async function controlPump(action) {
+    console.log(`[dashboard] controlPump("${action}") clicked — netlify mode: ${IS_NETLIFY}`);
     // Send to Firebase
     try {
         await firebaseCommand('controls/pump', action);
@@ -241,6 +248,10 @@ async function controlPump(action) {
                 data.autoPump === 'enabled',
                 data.pumpManualOverride === 'active'
             );
+            // Local mode previously gave no visible feedback at all on success —
+            // only the small status text changed — which made a working button
+            // feel identical to a dead one.
+            showToast(`Dosing Pump: ${String(data.pump).toUpperCase()}`);
             await fetchLiveData();
         } catch (error) {
             console.error('Local dosing pump control error:', error);
@@ -250,6 +261,7 @@ async function controlPump(action) {
 }
 
 async function controlPumpAuto(action) {
+    console.log(`[dashboard] controlPumpAuto("${action}") clicked — netlify mode: ${IS_NETLIFY}`);
     try {
         await firebaseCommand('controls/autoPump', action);
         if (IS_NETLIFY) showToast(`Auto Pump: ${action.toUpperCase()} sent to Firebase`);
@@ -266,6 +278,7 @@ async function controlPumpAuto(action) {
                 data.autoPump === 'enabled',
                 data.pumpManualOverride === 'active'
             );
+            showToast(`Auto Dosing: ${String(data.autoPump).toUpperCase()}`);
             await fetchLiveData();
         } catch (error) {
             console.error('Local auto dosing control error:', error);
