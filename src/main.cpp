@@ -138,7 +138,7 @@ unsigned long lastPumpOffTime = 0;
 bool pumpWasTurnedOn = false;  // Track if pump was just turned on automatically
 bool waterLevelHigh = false;
 bool lastWaterLevelHigh = true;
-bool gsmEnabled = false;
+bool gsmEnabled = true;
 String gsmPhoneNumber = DEFAULT_GSM_PHONE;
 String gsmAlertMessage = DEFAULT_GSM_MESSAGE;
 bool gsmInitialized = false;
@@ -302,9 +302,15 @@ bool sendGsmSms(const String &to, const String &message) {
 
 void loadGsmSettings() {
   gsmPrefs.begin("gsm", false);
-  gsmEnabled = gsmPrefs.getBool("enabled", false);
+  gsmEnabled = gsmPrefs.getBool("enabled", true);
   gsmPhoneNumber = gsmPrefs.getString("phone", DEFAULT_GSM_PHONE);
+  if (gsmPhoneNumber.length() < 5) {
+    gsmPhoneNumber = DEFAULT_GSM_PHONE;
+  }
   gsmAlertMessage = gsmPrefs.getString("msg", DEFAULT_GSM_MESSAGE);
+  if (gsmAlertMessage.length() == 0) {
+    gsmAlertMessage = DEFAULT_GSM_MESSAGE;
+  }
   Serial.printf("[GSM] Settings loaded: enabled=%s, phone=%s\n", gsmEnabled ? "true" : "false", gsmPhoneNumber.c_str());
 }
 
@@ -528,10 +534,10 @@ void updateLCDDisplay() {
   char row3[17] = "                ";
   char row4[17] = "                ";
 
-  snprintf(row1, sizeof(row1), "P:%s A:%s", pumpActive ? "ON " : "OFF", autoPumpEnabled ? "ON" : "OF");
-  snprintf(row2, sizeof(row2), "EC:%4.2fmS  W:%2.0f", data.tdsMScm, data.waterTemp);
-  snprintf(row3, sizeof(row3), "F:%4.1fL/m  L:%s", data.flowRateMlMin / 1000.0f, data.waterLevelHigh ? "HIGH" : "LOW");
-  snprintf(row4, sizeof(row4), "GSM:%s  OV:%s", gsmEnabled ? "ON" : "OFF", pumpManualOverride ? "YES" : "NO");
+  snprintf(row1, sizeof(row1), "PUMP:%s  AUTO:%s", pumpActive ? "ON" : "OFF", autoPumpEnabled ? "ON" : "OFF");
+  snprintf(row2, sizeof(row2), "EC:%4.2f W:%4.1fC", data.tdsMScm, data.waterTemp);
+  snprintf(row3, sizeof(row3), "F:%4.1fLPM L:%s", data.flowRateMlMin / 1000.0f, data.waterLevelHigh ? "HIGH" : "LOW");
+  snprintf(row4, sizeof(row4), "GSM:%s OV:%s", gsmEnabled ? "ON" : "OFF", pumpManualOverride ? "YES" : "NO");
 
   lcd.setCursor(0, 0);
   lcd.print("                ");
