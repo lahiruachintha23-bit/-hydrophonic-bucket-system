@@ -144,6 +144,11 @@ bool gsmEnabled = true;
 String gsmPhoneNumber = DEFAULT_GSM_PHONE;
 String gsmAlertMessage = DEFAULT_GSM_MESSAGE;
 bool gsmInitialized = false;
+// True once the expensive one-per-boot diagnostics (long registration wait and
+// the ~60s AT+COPS=? network scan) have run. They exist to diagnose a first-time
+// setup, not to repeat on every reconnect attempt — repeating them blocked the
+// modem long enough that the following AT went unanswered.
+bool gsmDeepProbeDone = false;
 // Set by the /api/gsm/send web handler, acted on in loop(). The web handler
 // runs in the async_tcp task; calling the multi-second sendGsmSms() there
 // starved that task and tripped the task watchdog, rebooting the board. The
@@ -314,13 +319,101 @@ bool initGsmModule() {
     sim900.read();
   }
 
-  sim900.println("AT");
-  String atResponse = readGsmResponse(2000);
-  if (atResponse.indexOf("OK") == -1) {
+  // Retry the handshake instead of judging the modem dead on one try. A single
+  // AT often goes unanswered when the module is still booting, is mid-way
+  // through a previous long operation (a network scan can leave it busy for a
+  // minute), or hasn't finished autobauding. Several spaced attempts cost
+  // little and avoid falsely declaring a working modem absent.
+  String atResponse;
+  bool answered = false;
+  for (int i = 0; i < 5; i++) {
+    sim900.println("AT");
+    atResponse = readGsmResponse(1500);
+    if (atResponse.indexOf("OK") != -1) { answered = true; break; }
+    Serial.printf("[GSM] No answer to AT (attempt %d/5), retrying...\n", i + 1);
+  }
+  if (!answered) {
     gsmInitialized = false;
-    Serial.println("[GSM] Modem did not answer AT");
+    Serial.println("[GSM] Modem did not answer AT after 5 attempts — it may still be busy from a previous operation, or check power/TX-RX wiring.");
     return false;
   }
+
+  // Verbose error codes. Without this the modem replies to a failed AT+CPIN?
+  // with a bare "ERROR" that hides the cause; with CMEE=2 it returns e.g.
+  // "+CME ERROR: SIM not inserted" / "SIM failure" / "SIM busy", which tells us
+  // exactly what's wrong instead of guessing.
+  sim900.println("AT+CMEE=2");
+  readGsmResponse(1000);
+
+  // Force full RF/SIM functionality. A module that powered up in minimum
+  // functionality (CFUN=0) leaves the SIM unpowered and answers AT+CPIN? with
+  // an error even when a perfectly good SIM is inserted. CFUN=1 powers it.
+  sim900.println("AT+CFUN=1");
+  readGsmResponse(3000);
+
+  // The SIM can take a couple of seconds to become readable after CFUN=1, so
+  // poll CPIN a few times rather than judging it on a single early read.
+  bool simReady = false;
+  for (int i = 0; i < 5; i++) {
+    sim900.println("AT+CPIN?");
+    String pin = readGsmResponse(1500);
+    if (pin.indexOf("READY") != -1) { simReady = true; break; }
+    Serial.printf("[GSM] CPIN not ready yet (attempt %d/5)\n", i + 1);
+    delay(1000);
+  }
+  if (!simReady) {
+    Serial.println("[GSM] SIM never reported READY. See the +CME ERROR reason above:");
+    Serial.println("[GSM]   'SIM not inserted' -> physical contact: reseat SIM, check the holder springs, clean contacts.");
+    Serial.println("[GSM]   'SIM failure'/'SIM busy' -> usually power: the module needs 3.4-4.4V and up to 2A bursts; a sagging supply corrupts SIM init.");
+  }
+
+  // Automatic operator selection. If a previous session left the module locked
+  // to a manual operator (COPS=1) that isn't available, it will never register;
+  // COPS=0 lets it pick whatever network it can actually see.
+  sim900.println("AT+COPS=0");
+  readGsmResponse(3000);
+
+  // Wait for network registration. Registration routinely takes 15-45s after a
+  // cold start, but the send path was judging it on a single immediate read and
+  // giving up. Poll CREG here (watchdog-fed inside readGsmResponse) so the
+  // module gets a fair chance to attach before we ever try to send.
+  //
+  // Only on the FIRST init, though. sendGsmSms() re-inits whenever a previous
+  // send failed, so leaving this (and especially the 60s scan below) unguarded
+  // meant every failed send triggered ~100s of blocking modem work — which left
+  // the modem too busy to answer the next AT, making it look like the module
+  // had died. Later re-inits do the quick handshake only.
+  bool registered = false;
+  for (int i = 0; i < (gsmDeepProbeDone ? 3 : 20); i++) {   // ~6s on re-init, ~40s at boot
+    sim900.println("AT+CREG?");
+    String reg = readGsmResponse(1500);
+    if (reg.indexOf(",1") != -1 || reg.indexOf(",5") != -1) { registered = true; break; }
+    Serial.printf("[GSM] Waiting for network registration (attempt %d)...\n", i + 1);
+    delay(500);
+  }
+
+  // Which operator, if any, did it attach to?
+  sim900.println("AT+COPS?");
+  readGsmResponse(2000);
+
+  if (!registered && !gsmDeepProbeDone) {
+    Serial.println("[GSM] Still not registered after ~40s. Scanning for visible networks (this can take up to a minute)...");
+    // AT+COPS=? forces a full scan and lists every network the module can see.
+    // This is the decisive test: SIM800/SIM900 are 2G(GSM)-ONLY. If this list
+    // is empty or contains no 2G network, the module physically cannot register
+    // here even with a perfect SIM — the carrier's 2G may be off or out of
+    // range, while your phone works because it uses 3G/4G.
+    sim900.println("AT+COPS=?");
+    String scan = readGsmResponse(60000);
+    if (scan.indexOf("+COPS:") != -1 && scan.length() > 12) {
+      Serial.println("[GSM] Networks visible above. If none are listed as 2G/GSM, this 2G-only module can't register here.");
+    } else {
+      Serial.println("[GSM] No networks found in scan -> no reachable 2G coverage, or an antenna problem. Check the GSM antenna is fitted; confirm the carrier still runs 2G/GSM in your area.");
+    }
+  }
+  // Mark the one-per-boot deep probe as spent, whether or not it ran: from here
+  // on, re-inits take the fast path.
+  gsmDeepProbeDone = true;
 
   logGsmDiagnostics();
 
