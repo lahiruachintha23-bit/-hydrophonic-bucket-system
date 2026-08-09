@@ -224,6 +224,60 @@ String readGsmResponse(unsigned long timeoutMs) {
   return response;
 }
 
+// Returns as soon as EITHER token shows up instead of always blocking for the
+// full timeout. The modem usually responds in well under a second when
+// things are working; always waiting the full timeout (as the old
+// fixed-delay code did at every step) turned one SMS send into a ~20+ second
+// block of the main loop, which is why the float-switch alert used to stall
+// sensor/Firebase/LCD updates every time it fired. Used for the final
+// AT+CMGS confirmation, where the modem can report success ("OK"/"+CMGS:")
+// or failure ("ERROR"/"+CMS ERROR") — without checking for both, a rejected
+// send (bad number, no credit, network error, ...) would otherwise block for
+// the full timeout every time before being reported.
+String waitForGsmTokens(const char *token1, const char *token2, unsigned long timeoutMs) {
+  unsigned long start = millis();
+  String response;
+  while (millis() - start < timeoutMs) {
+    while (sim900.available()) {
+      char c = sim900.read();
+      response += c;
+      if (response.indexOf(token1) != -1 || (token2 && response.indexOf(token2) != -1)) {
+        Serial.println(response);
+        return response;
+      }
+    }
+    delay(10);
+  }
+  response.trim();
+  if (response.length() > 0) Serial.println(response);
+  return response;
+}
+
+String waitForGsmToken(const char *token, unsigned long timeoutMs) {
+  return waitForGsmTokens(token, nullptr, timeoutMs);
+}
+
+// Logs signal quality, network registration, and SIM status right after the
+// modem answers "AT". These three are the most common reasons a modem passes
+// the basic AT handshake (proving it's powered and wired correctly) but still
+// can't send an SMS: no SIM/locked SIM, no network registration, or too weak
+// a signal. Read from the Serial Monitor at 115200 baud to diagnose a failed
+// send instead of guessing.
+void logGsmDiagnostics() {
+  sim900.println("AT+CSQ");
+  String csq = readGsmResponse(1000);
+  sim900.println("AT+CREG?");
+  String creg = readGsmResponse(1000);
+  sim900.println("AT+CPIN?");
+  String cpin = readGsmResponse(1000);
+  Serial.println("[GSM] --- Diagnostics ---");
+  Serial.printf("[GSM] Signal (AT+CSQ): %s\n", csq.c_str());
+  Serial.printf("[GSM] Network reg (AT+CREG?): %s\n", creg.c_str());
+  Serial.printf("[GSM] SIM status (AT+CPIN?): %s\n", cpin.c_str());
+  Serial.println("[GSM] CSQ: 0-9=poor/none, 10-14=ok, 15-31=good, 99=unknown. CREG should contain \",1\" (home) or \",5\" (roaming). CPIN should read READY.");
+  Serial.println("[GSM] -------------------");
+}
+
 void pollGsmOutput() {
   while (sim900.available()) {
     String response = sim900.readStringUntil('\n');
@@ -252,6 +306,8 @@ bool initGsmModule() {
     return false;
   }
 
+  logGsmDiagnostics();
+
   sim900.println("AT+CMGF=1");
   readGsmResponse(1000);
 
@@ -269,33 +325,54 @@ bool sendGsmSms(const String &to, const String &message) {
     return false;
   }
 
-  if (!initGsmModule()) {
+  // Only run the full ~9s reset-and-handshake sequence when the modem isn't
+  // already known-good. Re-running it on every single send (the old
+  // behaviour) roughly doubled how long each alert blocked the main loop for
+  // no benefit when the modem was already responding fine.
+  if (!gsmInitialized && !initGsmModule()) {
     return false;
   }
 
   Serial.println("[GSM] Sending SMS...");
   sim900.println("AT+CMGF=1");
-  delay(1000);
-  readGsmResponse(1000);
+  readGsmResponse(500);
 
   sim900.print("AT+CMGS=\"");
   sim900.print(to);
   sim900.println("\"");
-  delay(2000);
-  readGsmResponse(2000);
+
+  // Wait for the modem's actual ">" prompt instead of guessing a fixed delay
+  // was long enough. If the prompt never arrives (weak signal, not
+  // registered, SIM issue), the message text below would otherwise be sent
+  // straight into the AT command parser instead of as SMS content, which
+  // silently fails without ever showing up as a real error.
+  String prompt = waitForGsmToken(">", 5000);
+  if (prompt.indexOf(">") == -1) {
+    Serial.println("[GSM] Modem never returned the '>' prompt for AT+CMGS — check signal/registration/SIM above");
+    sim900.write(27);  // ESC cancels a pending CMGS so the modem doesn't stay stuck waiting for a message
+    delay(200);
+    gsmInitialized = false;
+    return false;
+  }
 
   sim900.print(message);
-  delay(500);
-  sim900.write(26);
-  delay(5000);
+  delay(200);
+  sim900.write(26);  // Ctrl+Z submits the message
 
-  String sendResponse = readGsmResponse(3000);
-  if (sendResponse.indexOf("OK") != -1 || sendResponse.indexOf("+CMGS:") != -1) {
+  // SMS submission can genuinely take several seconds over a slow/weak
+  // network, but returns immediately once the network accepts or rejects it,
+  // so wait for either outcome rather than blocking a fixed worst-case time.
+  String sendResponse = waitForGsmTokens("OK", "ERROR", 20000);
+  if (sendResponse.indexOf("+CMGS:") != -1 || sendResponse.indexOf("OK") != -1) {
     Serial.printf("[GSM] SMS sent to %s\n", to.c_str());
     return true;
   }
 
-  Serial.println("[GSM] No confirmation from modem after SMS send");
+  if (sendResponse.indexOf("ERROR") != -1) {
+    Serial.printf("[GSM] Send rejected by modem/network: %s\n", sendResponse.c_str());
+  } else {
+    Serial.println("[GSM] No confirmation from modem after SMS send (timed out)");
+  }
   gsmInitialized = false;
   return false;
 }
@@ -503,18 +580,34 @@ void sendStatusJson(AsyncWebServerRequest *request) {
 }
 
 // ==================== LCD Display ====================
+// The vendored LiquidCrystal_I2C library's setCursor() uses DDRAM row offsets
+// {0x00, 0x40, 0x14, 0x54}, which is the layout for 20-column HD44780
+// displays (row 3 starts 20 chars after row 1, row 4 20 chars after row 2).
+// On a genuine 16-column x 4-row module, row 3 actually starts right after
+// row 1's 16 characters (0x10) and row 4 right after row 2's (0x50). Using
+// the library's 20-column offsets addresses rows 3-4 at DDRAM locations that
+// don't map to any visible character on a 16-wide display, which is exactly
+// why only the top two rows ever showed anything. Bypass setCursor() and
+// address the DDRAM directly with the correct 16-column offsets instead.
+const uint8_t LCD_ROW_OFFSETS_16COL[4] = { 0x00, 0x40, 0x10, 0x50 };
+
+void lcdSetCursor16x4(uint8_t col, uint8_t row) {
+  if (row > 3) row = 3;
+  lcd.command(LCD_SETDDRAMADDR | (col + LCD_ROW_OFFSETS_16COL[row]));
+}
+
 void setupLCD() {
   Wire.begin(I2C_SDA, I2C_SCL);
   lcd.init();
   lcd.backlight();
   lcd.clear();
-  lcd.setCursor(0, 0);
+  lcdSetCursor16x4(0, 0);
   lcd.print("Hydroponic System");
-  lcd.setCursor(0, 1);
+  lcdSetCursor16x4(0, 1);
   lcd.print("Initializing...");
-  lcd.setCursor(0, 2);
+  lcdSetCursor16x4(0, 2);
   lcd.print("Please wait...");
-  lcd.setCursor(0, 3);
+  lcdSetCursor16x4(0, 3);
   lcd.print(" ");
   lcdAvailable = true;
   Serial.println("LCD initialized successfully");
@@ -539,24 +632,24 @@ void updateLCDDisplay() {
   snprintf(row3, sizeof(row3), "F:%4.1fLPM L:%s", data.flowRateMlMin / 1000.0f, data.waterLevelHigh ? "HIGH" : "LOW");
   snprintf(row4, sizeof(row4), "GSM:%s OV:%s", gsmEnabled ? "ON" : "OFF", pumpManualOverride ? "YES" : "NO");
 
-  lcd.setCursor(0, 0);
+  lcdSetCursor16x4(0, 0);
   lcd.print("                ");
-  lcd.setCursor(0, 0);
+  lcdSetCursor16x4(0, 0);
   lcd.print(row1);
 
-  lcd.setCursor(0, 1);
+  lcdSetCursor16x4(0, 1);
   lcd.print("                ");
-  lcd.setCursor(0, 1);
+  lcdSetCursor16x4(0, 1);
   lcd.print(row2);
 
-  lcd.setCursor(0, 2);
+  lcdSetCursor16x4(0, 2);
   lcd.print("                ");
-  lcd.setCursor(0, 2);
+  lcdSetCursor16x4(0, 2);
   lcd.print(row3);
 
-  lcd.setCursor(0, 3);
+  lcdSetCursor16x4(0, 3);
   lcd.print("                ");
-  lcd.setCursor(0, 3);
+  lcdSetCursor16x4(0, 3);
   lcd.print(row4);
 }
 
