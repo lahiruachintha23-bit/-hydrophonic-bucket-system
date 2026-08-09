@@ -309,33 +309,83 @@ void pollGsmOutput() {
   }
 }
 
+// Baud rates to try when talking to the modem. SIM800/SIM900 ship in autobaud
+// mode and latch onto whatever rate they first sync at, which can differ from
+// GSM_BAUD after a power cycle or a previous session. A fixed-rate assumption
+// then makes a perfectly healthy module look completely dead: it receives only
+// garbage and never replies. GSM_BAUD is tried first so the normal case costs
+// nothing extra.
+const uint32_t GSM_BAUD_CANDIDATES[] = { GSM_BAUD, 115200, 57600, 38400, 19200, 4800 };
+
+// Opens the serial port at `baud` and sends AT a few times, returning true if
+// the modem answers. Several attempts per rate because the first AT after a
+// port change is often swallowed while the module re-syncs.
+bool gsmTryBaud(uint32_t baud, int attempts) {
+  sim900.end();
+  delay(200);
+  sim900.begin(baud, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+  delay(300);
+  while (sim900.available()) sim900.read();   // discard sync garbage
+
+  for (int i = 0; i < attempts; i++) {
+    sim900.println("AT");
+    if (readGsmResponse(1000).indexOf("OK") != -1) return true;
+  }
+  return false;
+}
+
 bool initGsmModule() {
+  // Give the module time to finish its own boot before expecting replies.
   sim900.end();
   delay(200);
   sim900.begin(GSM_BAUD, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
   delay(5000);
+  while (sim900.available()) sim900.read();
 
-  while (sim900.available()) {
-    sim900.read();
-  }
-
-  // Retry the handshake instead of judging the modem dead on one try. A single
-  // AT often goes unanswered when the module is still booting, is mid-way
-  // through a previous long operation (a network scan can leave it busy for a
-  // minute), or hasn't finished autobauding. Several spaced attempts cost
-  // little and avoid falsely declaring a working modem absent.
-  String atResponse;
+  // Find the rate the modem is actually talking at, rather than assuming.
   bool answered = false;
-  for (int i = 0; i < 5; i++) {
-    sim900.println("AT");
-    atResponse = readGsmResponse(1500);
-    if (atResponse.indexOf("OK") != -1) { answered = true; break; }
-    Serial.printf("[GSM] No answer to AT (attempt %d/5), retrying...\n", i + 1);
+  uint32_t activeBaud = GSM_BAUD;
+  for (uint32_t candidate : GSM_BAUD_CANDIDATES) {
+    Serial.printf("[GSM] Probing modem at %u baud...\n", candidate);
+    if (gsmTryBaud(candidate, 3)) {
+      answered = true;
+      activeBaud = candidate;
+      Serial.printf("[GSM] Modem answered at %u baud\n", candidate);
+      break;
+    }
   }
+
   if (!answered) {
     gsmInitialized = false;
-    Serial.println("[GSM] Modem did not answer AT after 5 attempts — it may still be busy from a previous operation, or check power/TX-RX wiring.");
+    Serial.println("[GSM] No answer at any baud rate. This is a hardware/state problem, not a settings one:");
+    Serial.println("[GSM]   1. POWER-CYCLE THE MODULE ITSELF — resetting the ESP32 does not reset it, and it can hang from a previous operation.");
+    Serial.printf("[GSM]   2. Check wiring: ESP32 GPIO%d(RX) <- module TX, GPIO%d(TX) -> module RX, and GROUND SHARED with the module supply.\n", GSM_RX_PIN, GSM_TX_PIN);
+    Serial.println("[GSM]   3. Check the module's status/network LED is lit — an unlit module is unpowered or held in reset.");
+    Serial.println("[GSM]   4. Confirm its supply holds 3.4-4.4V under load (it browns out on ~2A bursts).");
     return false;
+  }
+
+  // Pin the rate so it stays put across future re-inits instead of drifting
+  // back into autobaud and forcing another sweep.
+  if (activeBaud != GSM_BAUD) {
+    Serial.printf("[GSM] Note: modem is at %u baud, not the configured %u. Locking it to %u.\n",
+                  activeBaud, (uint32_t)GSM_BAUD, (uint32_t)GSM_BAUD);
+    sim900.printf("AT+IPR=%u\r\n", (uint32_t)GSM_BAUD);
+    readGsmResponse(1000);
+    sim900.end();
+    delay(200);
+    sim900.begin(GSM_BAUD, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+    delay(500);
+    while (sim900.available()) sim900.read();
+    // Confirm it followed us to the new rate; fall back to the working one.
+    sim900.println("AT");
+    if (readGsmResponse(1500).indexOf("OK") == -1) {
+      Serial.println("[GSM] Modem did not follow the baud change; staying at the detected rate.");
+      sim900.end();
+      delay(200);
+      sim900.begin(activeBaud, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+      delay(500);
+    }
   }
 
   // Verbose error codes. Without this the modem replies to a failed AT+CPIN?
