@@ -13,6 +13,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
+#include <esp_task_wdt.h>
 
 // ==================== Connection constants ====================
 const char* WIFI_SSID = "Infinix NOTE 40";
@@ -143,6 +144,12 @@ bool gsmEnabled = true;
 String gsmPhoneNumber = DEFAULT_GSM_PHONE;
 String gsmAlertMessage = DEFAULT_GSM_MESSAGE;
 bool gsmInitialized = false;
+// Set by the /api/gsm/send web handler, acted on in loop(). The web handler
+// runs in the async_tcp task; calling the multi-second sendGsmSms() there
+// starved that task and tripped the task watchdog, rebooting the board. The
+// handler now just raises this flag and returns instantly, and loop() (the
+// loopTask, which we can safely feed the watchdog from) does the actual send.
+volatile bool gsmManualSendRequested = false;
 bool gsmAlertPending = false;
 unsigned long lastGsmAlertAttemptAt = 0;
 const unsigned long GSM_ALERT_RETRY_MS = 30000;
@@ -208,6 +215,14 @@ void setAutoPump(bool enabled) {
   }
 }
 
+// Keeps the task watchdog fed during a blocking GSM wait. esp_task_wdt_reset()
+// only affects the current task if it's subscribed (loopTask is), and returns a
+// harmless error otherwise, so this is safe to call from any context.
+static inline void gsmWaitTick() {
+  esp_task_wdt_reset();
+  delay(10);
+}
+
 String readGsmResponse(unsigned long timeoutMs) {
   unsigned long start = millis();
   String response;
@@ -216,7 +231,7 @@ String readGsmResponse(unsigned long timeoutMs) {
       char c = sim900.read();
       response += c;
     }
-    delay(10);
+    gsmWaitTick();
   }
   response.trim();
   if (response.length() > 0) {
@@ -247,7 +262,7 @@ String waitForGsmTokens(const char *token1, const char *token2, unsigned long ti
         return response;
       }
     }
-    delay(10);
+    gsmWaitTick();
   }
   response.trim();
   if (response.length() > 0) Serial.println(response);
@@ -331,6 +346,27 @@ bool sendGsmSms(const String &to, const String &message) {
   // behaviour) roughly doubled how long each alert blocked the main loop for
   // no benefit when the modem was already responding fine.
   if (!gsmInitialized && !initGsmModule()) {
+    return false;
+  }
+
+  // Fast SIM + registration pre-check. Without this, a send attempt with no
+  // working SIM (AT+CPIN? -> ERROR, as this board is currently showing) still
+  // marched all the way to AT+CMGS and then blocked the full 5s waiting for a
+  // ">" prompt that never comes, plus up to 20s for a confirmation — long
+  // enough to trip the task watchdog and reboot the board. Checking first fails
+  // in ~2s and never enters those long waits when the SIM can't send anyway.
+  sim900.println("AT+CPIN?");
+  String pin = readGsmResponse(1000);
+  if (pin.indexOf("READY") == -1) {
+    Serial.println("[GSM] SIM not ready (AT+CPIN? did not return READY). Check the SIM is inserted, unlocked, and the module has enough power. Aborting send.");
+    return false;
+  }
+  sim900.println("AT+CREG?");
+  String reg = readGsmResponse(1000);
+  // ",1" = registered home network, ",5" = registered roaming. Anything else
+  // (",0" not searching, ",2" searching, ",3" denied) means we can't send yet.
+  if (reg.indexOf(",1") == -1 && reg.indexOf(",5") == -1) {
+    Serial.println("[GSM] Not registered on a network (AT+CREG? not ,1/,5). Aborting send; will keep retrying.");
     return false;
   }
 
@@ -817,20 +853,19 @@ void setupWebServer() {
       return;
     }
 
-    bool sent = sendGsmSms(gsmPhoneNumber, gsmAlertMessage);
-    if (sent) {
-      doc["status"] = "ok";
-      doc["message"] = "SMS sent";
-    } else {
-      doc["status"] = "error";
-      doc["message"] = "SMS send failed";
-    }
+    // Do NOT call sendGsmSms() here. This callback runs in the async_tcp task,
+    // and sendGsmSms() blocks for seconds; doing it inline starved that task
+    // and tripped the task watchdog, rebooting the board mid-send. Queue it for
+    // loop() to handle and return immediately.
+    gsmManualSendRequested = true;
+    doc["status"] = "queued";
+    doc["message"] = "SMS queued — sending in background, watch the device";
     doc["enabled"] = gsmEnabled;
     doc["phoneNumber"] = gsmPhoneNumber;
     doc["messageText"] = gsmAlertMessage;
     String response;
     serializeJson(doc, response);
-    sendJson(request, sent ? 200 : 500, response);
+    sendJson(request, 200, response);
   });
 
   server.on("/api/gsm", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1459,6 +1494,15 @@ void loop() {
     }
   }
   
+  // Manual "Send Now" from the local dashboard: the web handler only sets the
+  // flag (it runs in the async task and must not block), so the actual send
+  // happens here in loopTask where the watchdog is fed during the GSM waits.
+  if (gsmManualSendRequested) {
+    gsmManualSendRequested = false;
+    Serial.println("[GSM] Manual send requested from dashboard");
+    sendGsmSms(gsmPhoneNumber, gsmAlertMessage);
+  }
+
   // Refresh the sensor cache once per pass; every other consumer reads from it.
   updateSensorCache();
   SensorData data = latestData;

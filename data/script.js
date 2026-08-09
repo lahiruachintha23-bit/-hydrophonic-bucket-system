@@ -473,8 +473,10 @@ async function sendManualGsmMessage() {
             await sendGsmCommandViaFirebase();
         } else {
             const data = await apiPostForm('/api/gsm/send', {});
-            if (data.status === 'ok') {
-                showToast('SMS sent successfully');
+            // The device now queues the send and returns immediately (status
+            // "queued") so its web server task can't block and reboot the board.
+            if (data.status === 'ok' || data.status === 'queued') {
+                showToast(data.message || 'SMS queued');
             } else {
                 showToast(data.message || 'SMS send failed');
             }
