@@ -722,30 +722,15 @@ void setupWebServer() {
     sendStatusJson(request);
   });
 
-  server.on("/api/pump", HTTP_POST, [](AsyncWebServerRequest *request) {
-    String action;
-    if (!getActionParam(request, action)) {
-      request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing action parameter\"}");
-      return;
-    }
-
-    if (action == "on") {
-      setPump(true);
-      pumpManualOverride = true;
-      pumpManualOverrideTimeout = millis() + MANUAL_OVERRIDE_TIMEOUT_MS;
-    }
-    else if (action == "off") {
-      setPump(false);
-      pumpManualOverride = true;
-      pumpManualOverrideTimeout = millis() + MANUAL_OVERRIDE_TIMEOUT_MS;
-    }
-    else {
-      request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid action\"}");
-      return;
-    }
-    sendStatusJson(request);
-  });
-
+  // IMPORTANT — route registration order.
+  // ESPAsyncWebServer's callback handler matches a request when the URL equals
+  // the registered path OR begins with "<path>/", and the FIRST registered
+  // handler that matches wins. That means "/api/pump" also matches
+  // "/api/pump/auto", and "/api/gsm" also matches "/api/gsm/send". So the more
+  // specific sub-paths MUST be registered before their parents, otherwise the
+  // parent silently handles them: this is why "Send Now" was logging
+  // "[GSM] Settings saved" (it hit the /api/gsm save handler) and why the auto
+  // and manual pump buttons were being cross-handled. Register children first.
   server.on("/api/pump/auto", HTTP_POST, [](AsyncWebServerRequest *request) {
     String action;
     if (!getActionParam(request, action)) {
@@ -766,6 +751,30 @@ void setupWebServer() {
     } else { // "disable"
       setAutoPump(false);
       pumpManualOverride = false;
+    }
+    sendStatusJson(request);
+  });
+
+  server.on("/api/pump", HTTP_POST, [](AsyncWebServerRequest *request) {
+    String action;
+    if (!getActionParam(request, action)) {
+      request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing action parameter\"}");
+      return;
+    }
+
+    if (action == "on") {
+      setPump(true);
+      pumpManualOverride = true;
+      pumpManualOverrideTimeout = millis() + MANUAL_OVERRIDE_TIMEOUT_MS;
+    }
+    else if (action == "off") {
+      setPump(false);
+      pumpManualOverride = true;
+      pumpManualOverrideTimeout = millis() + MANUAL_OVERRIDE_TIMEOUT_MS;
+    }
+    else {
+      request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid action\"}");
+      return;
     }
     sendStatusJson(request);
   });
@@ -792,6 +801,36 @@ void setupWebServer() {
     String response;
     serializeJson(doc, response);
     sendJson(request, 200, response);
+  });
+
+  // Registered before "/api/gsm" — see the route-order note above the pump
+  // handlers. Without this ordering, "/api/gsm" catches "/api/gsm/send" and
+  // runs the settings-save path instead of sending the SMS.
+  server.on("/api/gsm/send", HTTP_POST, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    if (gsmPhoneNumber.length() < 5 || gsmAlertMessage.length() == 0) {
+      doc["status"] = "error";
+      doc["message"] = "GSM phone number or message not configured";
+      String response;
+      serializeJson(doc, response);
+      sendJson(request, 400, response);
+      return;
+    }
+
+    bool sent = sendGsmSms(gsmPhoneNumber, gsmAlertMessage);
+    if (sent) {
+      doc["status"] = "ok";
+      doc["message"] = "SMS sent";
+    } else {
+      doc["status"] = "error";
+      doc["message"] = "SMS send failed";
+    }
+    doc["enabled"] = gsmEnabled;
+    doc["phoneNumber"] = gsmPhoneNumber;
+    doc["messageText"] = gsmAlertMessage;
+    String response;
+    serializeJson(doc, response);
+    sendJson(request, sent ? 200 : 500, response);
   });
 
   server.on("/api/gsm", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -831,33 +870,6 @@ void setupWebServer() {
     String response;
     serializeJson(doc, response);
     sendJson(request, 200, response);
-  });
-
-  server.on("/api/gsm/send", HTTP_POST, [](AsyncWebServerRequest *request) {
-    JsonDocument doc;
-    if (gsmPhoneNumber.length() < 5 || gsmAlertMessage.length() == 0) {
-      doc["status"] = "error";
-      doc["message"] = "GSM phone number or message not configured";
-      String response;
-      serializeJson(doc, response);
-      sendJson(request, 400, response);
-      return;
-    }
-
-    bool sent = sendGsmSms(gsmPhoneNumber, gsmAlertMessage);
-    if (sent) {
-      doc["status"] = "ok";
-      doc["message"] = "SMS sent";
-    } else {
-      doc["status"] = "error";
-      doc["message"] = "SMS send failed";
-    }
-    doc["enabled"] = gsmEnabled;
-    doc["phoneNumber"] = gsmPhoneNumber;
-    doc["messageText"] = gsmAlertMessage;
-    String response;
-    serializeJson(doc, response);
-    sendJson(request, sent ? 200 : 500, response);
   });
 
   server.on("/api/testrelay", HTTP_GET, [](AsyncWebServerRequest *request) {
