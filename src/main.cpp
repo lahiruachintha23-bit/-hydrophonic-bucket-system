@@ -127,6 +127,10 @@ HardwareSerial sim900(2);
 
 // ==================== Global Variables ====================
 volatile unsigned long flowPulseCount = 0;
+// Never reset, unlike flowPulseCount (which is zeroed every calculation window).
+// This is the diagnostic that matters: if it stays 0 forever, the ISR is never
+// firing, so no amount of flow-rate maths will help — the signal isn't arriving.
+volatile unsigned long flowPulseTotal = 0;
 unsigned long lastFlowCalcMs = 0;
 float flowRateMlMin = 0.0f;
 bool pumpActive = false;
@@ -175,6 +179,7 @@ struct SensorData {
 
 void IRAM_ATTR flowISR() {
   flowPulseCount++;
+  flowPulseTotal++;
 }
 
 // ==================== Relay Helpers ====================
@@ -720,6 +725,10 @@ String buildSensorJson() {
   // to emit mL/min here while Firebase sent L/min, so local mode read 1000x high.
   doc["flowRate"] = data.flowRateMlMin / 1000.0f;
   doc["flowRateMlMin"] = data.flowRateMlMin;
+  // Diagnostics: total pulses since boot and the current pin level. Visible at
+  // http://<ESP32_IP>/api/sensors without needing the Serial Monitor.
+  doc["flowPulseTotal"] = flowPulseTotal;
+  doc["flowPinLevel"] = digitalRead(FLOW_SENSOR_PIN) ? "HIGH" : "LOW";
   doc["waterLevel"] = data.waterLevelHigh ? "HIGH" : "LOW";
   doc["waterLevelValue"] = data.waterLevelHigh ? 1 : 0;
   doc["tdsPPM"] = data.tdsPPM;
@@ -1050,11 +1059,43 @@ void setupWebServer() {
     sendJson(request, 200, response);
   });
 
+  // Direct relay test, bypassing all dashboard JavaScript, Firebase, and the
+  // pump state machine. Open http://<ESP32_IP>/api/testrelay in a browser:
+  // if the relay clicks here but the dashboard buttons don't work, the fault is
+  // in the web layer; if it doesn't click here either, the fault is wiring,
+  // relay polarity, or relay power.
+  //
+  // Drives the pin BOTH ways with a pause, so you can hear which level actually
+  // energises the relay and thus whether RELAY_ACTIVE_LOW is set correctly for
+  // your board. Note it writes the GPIO directly rather than going through
+  // setPump(), so the reported pump state and the auto-dosing logic are left
+  // untouched by a diagnostic.
   server.on("/api/testrelay", HTTP_GET, [](AsyncWebServerRequest *request) {
-    setPump(true);
-    delay(700);
-    setPump(false);
-    request->send(200, "application/json", "{\"status\":\"ok\",\"relay\":\"pump_pulsed\"}");
+    Serial.println("[TEST] Relay test starting on GPIO " + String(PUMP_PIN));
+    Serial.println("[TEST] Driving pin LOW for 1.5s (ON for an ACTIVE-LOW relay board)...");
+    digitalWrite(PUMP_PIN, LOW);
+    delay(1500);
+    Serial.println("[TEST] Driving pin HIGH for 1.5s (ON for an ACTIVE-HIGH relay board)...");
+    digitalWrite(PUMP_PIN, HIGH);
+    delay(1500);
+    // Restore whatever the pump is supposed to be, so the test leaves no trace.
+    setRelayState(PUMP_PIN, pumpActive);
+    Serial.println("[TEST] Relay test complete. If the relay clicked on only ONE of the two phases,");
+    Serial.printf("[TEST] make sure RELAY_ACTIVE_LOW (currently %s) matches that phase.\n",
+                  RELAY_ACTIVE_LOW ? "true" : "false");
+    Serial.println("[TEST] If it never clicked, this is wiring/power, not software:");
+    Serial.printf("[TEST]   - Is the relay IN pin actually on GPIO %d?\n", PUMP_PIN);
+    Serial.println("[TEST]   - Does the relay board have its own VCC (5V) and a GROUND shared with the ESP32?");
+    Serial.println("[TEST]   - Many relay boards need 5V on VCC; 3.3V is often too low to pull the coil in.");
+
+    JsonDocument doc;
+    doc["status"] = "ok";
+    doc["pin"] = PUMP_PIN;
+    doc["relayActiveLow"] = RELAY_ACTIVE_LOW;
+    doc["message"] = "Pin driven LOW then HIGH for 1.5s each — listen for the relay click and check Serial Monitor";
+    String response;
+    serializeJson(doc, response);
+    sendJson(request, 200, response);
   });
 
   server.onNotFound([](AsyncWebServerRequest *request) {
@@ -1263,6 +1304,9 @@ void updateFirebase(const SensorData &data) {
     json["dhtHumidity"]       = data.dhtHumidity;
     json["waterTemperature"]  = data.waterTemp;
     json["flowRate"]          = data.flowRateMlMin / 1000.0f;
+    // Cumulative pulses since boot. Lets the cloud dashboard tell a genuinely
+    // idle sensor (total > 0, flow 0) apart from a disconnected one (total 0).
+    json["flowPulseTotal"]    = flowPulseTotal;
     json["waterLevel"]        = data.waterLevelHigh ? "HIGH" : "LOW";
     json["tdsPPM"]            = data.tdsPPM;
     json["tdsMScm"]           = data.tdsMScm;
@@ -1694,7 +1738,17 @@ void loop() {
     Serial.printf("Air Temp: %.2f C\n", data.dhtTemp);
     Serial.printf("Humidity: %.2f %%\n", data.dhtHumidity);
     Serial.printf("Water Temp: %.2f C\n", data.waterTemp);
-    Serial.printf("Flow: %.2f mL/min\n", data.flowRateMlMin);
+    // Pulse total and raw pin level make a dead sensor obvious. A YF-S201 idles
+    // HIGH (via the pull-up) and pulses LOW as the impeller turns, so with water
+    // flowing the level should flicker and the total should climb. Total stuck at
+    // 0 means no signal is reaching GPIO 18 at all.
+    Serial.printf("Flow: %.2f mL/min [pulses total: %lu, pin level: %s]\n",
+                  data.flowRateMlMin, flowPulseTotal,
+                  digitalRead(FLOW_SENSOR_PIN) ? "HIGH" : "LOW");
+    if (flowPulseTotal == 0) {
+      Serial.println("  ^ No flow pulses EVER received. Check: sensor VCC on 5V (not 3.3V),");
+      Serial.printf("    signal wire on GPIO %d, ground shared with the ESP32, and water actually moving.\n", FLOW_SENSOR_PIN);
+    }
     Serial.printf("Water Level: %s\n", data.waterLevelHigh ? "HIGH" : "LOW");
     Serial.printf("TDS: %.2f PPM (%.2f mS/cm) [raw ADC: %d]\n", data.tdsPPM, data.tdsMScm, lastTdsRawADC);
     Serial.printf("Pump: %s (Auto: %s, Manual Override: %s)\n", 

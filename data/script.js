@@ -604,7 +604,22 @@ function updateLiveDisplay(data) {
         setHTML('liveHumidity', `--<span class="unit">%</span>`);
     }
 
-    setHTML('liveFlow', `${Number(data.flowRate || 0).toFixed(2)}<span class="unit">L/min</span>`);
+    // Distinguish "sensor connected but no water moving" from "sensor never
+    // reported anything". Both used to render as a flat 0.00, which is why a
+    // disconnected sensor looked like a dashboard that wasn't updating.
+    // flowPulseTotal is cumulative since boot: 0 means the pulse interrupt has
+    // never once fired, so there is no signal reaching the board at all.
+    const flowPulses = Number(data.flowPulseTotal);
+    const flowSignalKnown = Number.isFinite(flowPulses);
+    if (flowSignalKnown && flowPulses === 0) {
+        setHTML('liveFlow', `--<span class="unit">L/min</span>`);
+        setText('debugFlowSensor', 'No signal — 0 pulses since boot');
+    } else {
+        setHTML('liveFlow', `${Number(data.flowRate || 0).toFixed(2)}<span class="unit">L/min</span>`);
+        setText('debugFlowSensor', flowSignalKnown
+            ? `OK — ${flowPulses.toLocaleString()} pulses since boot`
+            : '--');
+    }
     setHTML('liveTDS',  `${Number(data.tdsMScm  || 0).toFixed(2)}<span class="unit">mS/cm</span>`);
     setText('liveWaterLevel', data.waterLevel || 'LOW');
 
