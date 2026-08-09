@@ -505,10 +505,6 @@ function sendGsmCommandViaFirebase() {
         }
 
         const requestedAt = Date.now();
-        firebaseCommand('controls/gsmSend', 'send')
-            .then(() => showToast('Send command sent to device…'))
-            .catch((e) => console.warn('Firebase gsmSend write failed:', e));
-
         const ref = db.ref('device/gsmLastSendResult');
         let settled = false;
         const finish = (message) => {
@@ -519,6 +515,21 @@ function sendGsmCommandViaFirebase() {
             showToast(message);
             resolve();
         };
+
+        firebaseCommand('controls/gsmSend', 'send')
+            .then(() => showToast('Send command sent to device…'))
+            .catch((e) => {
+                console.warn('Firebase gsmSend write failed:', e);
+                // Report this immediately rather than letting it fall through to
+                // the 15s "no response from device" timeout, which would blame the
+                // device for what is actually a rejected write. PERMISSION_DENIED
+                // here means the database rules haven't been published with the
+                // gsmSend control whitelisted.
+                const denied = String(e && (e.code || e.message)).toUpperCase().includes('PERMISSION');
+                finish(denied
+                    ? 'Firebase rejected the command — publish the updated database rules (gsmSend not allowed yet)'
+                    : `Could not send command: ${e.message || e}`);
+            });
 
         const handler = ref.on('value', (snapshot) => {
             const val = snapshot.val();
